@@ -201,6 +201,58 @@ def write_mp3_file(path, pcm_bytes, sample_rate=RENDER_SAMPLE_RATE, channels=2, 
         f.write(data)
 
 
+# Brute-force scan range for enumerate_soundfont_presets(). SF2 banks are a
+# 14-bit MIDI concept in theory, but in practice essentially every SoundFont
+# (including hand-made game ones) only uses bank 0 (melodic) and bank 128
+# (percussion, by GM convention), with maybe a handful of extra banks for
+# variations. This range comfortably covers real-world fonts while staying
+# fast (a fixed ~16.6k cheap lookups regardless of font size).
+PRESET_SCAN_MAX_BANK = 129
+PRESET_SCAN_MAX_PRESET = 128
+
+
+def enumerate_soundfont_presets(synth, sfid):
+    """Return every (bank, preset, name) defined in the loaded SoundFont,
+    found by probing FluidSynth directly (there's no "list all presets" call
+    in the bindings, only "does this bank/preset exist"). Fast: a fixed
+    number of cheap C calls, independent of the font's actual size."""
+    presets = []
+    for bank in range(PRESET_SCAN_MAX_BANK + 1):
+        for preset in range(PRESET_SCAN_MAX_PRESET):
+            try:
+                name = synth.sfpreset_name(sfid, bank, preset)
+            except Exception:
+                name = None
+            if name:
+                presets.append((bank, preset, name))
+    return presets
+
+
+def summarize_channel_programs(events):
+    """For each MIDI channel used in events, figure out which (bank, program)
+    it would use by default, for display in the Channel Instruments dialog.
+    Snapshots each channel's bank/program state as of its first note, since
+    that's what a listener actually hears (a handful of songs send further
+    patch changes mid-track on the same channel, but the "first sound you
+    hear" is what matters for identifying which instrument sounds wrong)."""
+    state = {}
+    result = {}
+    for _abs_t, msg in events:
+        ch = getattr(msg, "channel", None)
+        if ch is None:
+            continue
+        st = state.setdefault(ch, {"bank": 0, "program": 0})
+        if msg.type == "control_change" and msg.control == 0:
+            st["bank"] = msg.value
+        elif msg.type == "program_change":
+            st["program"] = msg.program
+        elif msg.type in ("note_on", "note_off") and ch not in result:
+            result[ch] = (st["bank"], st["program"])
+    for ch, st in state.items():
+        result.setdefault(ch, (st["bank"], st["program"]))
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Library: remembers every SoundFont/MIDI you've imported, copies them into
 # app-local Soundfonts/ and Midis/ folders (deduped by content hash so
@@ -221,6 +273,11 @@ class LibraryManager:
             "midis": [],
             "last_soundfont_id": None,
             "last_midi_id": None,
+            # midi_id -> sfont_id -> {"<channel>": [bank, preset]}
+            # Lets a per-channel instrument fix be remembered for one
+            # specific song+SoundFont pairing, since a fix for one SoundFont
+            # is meaningless for another.
+            "channel_overrides": {},
         }
         for kind in self.KINDS.values():
             os.makedirs(os.path.join(app_dir, kind["folder"]), exist_ok=True)
@@ -320,6 +377,16 @@ class LibraryManager:
                 pass
         if self.data.get(f"last_{kind}_id") == entry_id:
             self.data[f"last_{kind}_id"] = None
+
+        # Clean up any channel overrides that referenced this entry, so
+        # library.json doesn't accumulate orphaned data forever.
+        co = self.data.setdefault("channel_overrides", {})
+        if kind == "midi":
+            co.pop(entry_id, None)
+        else:
+            for per_sfont in co.values():
+                per_sfont.pop(entry_id, None)
+
         self.save()
 
     def rename(self, kind, entry_id, new_name):
@@ -340,6 +407,29 @@ class LibraryManager:
 
     def get_last(self, kind):
         return self.data.get(f"last_{kind}_id")
+
+    # -- per-channel instrument overrides -----------------------------------
+    def get_channel_overrides(self, midi_id, sfont_id):
+        """Returns {channel:int -> (bank:int, preset:int)} for this specific
+        song+SoundFont pairing."""
+        raw = self.data.get("channel_overrides", {}).get(midi_id, {}).get(sfont_id, {})
+        return {int(ch): tuple(bp) for ch, bp in raw.items()}
+
+    def set_channel_override(self, midi_id, sfont_id, channel, bank, preset):
+        co = self.data.setdefault("channel_overrides", {})
+        co.setdefault(midi_id, {}).setdefault(sfont_id, {})[str(channel)] = [bank, preset]
+        self.save()
+
+    def clear_channel_override(self, midi_id, sfont_id, channel):
+        per_sfont = self.data.get("channel_overrides", {}).get(midi_id, {}).get(sfont_id, {})
+        per_sfont.pop(str(channel), None)
+        self.save()
+
+    def clear_all_channel_overrides(self, midi_id, sfont_id):
+        per_midi = self.data.get("channel_overrides", {}).get(midi_id)
+        if per_midi is not None and sfont_id in per_midi:
+            per_midi[sfont_id] = {}
+            self.save()
 
 
 class PlaybackEngine:
@@ -363,6 +453,30 @@ class PlaybackEngine:
         self._seek_target = None
         self._lock = threading.Lock()
         self._gain = 0.5  # 0.0 - 2.0
+
+        # channel:int -> (bank:int, preset:int). When a channel has an
+        # override, the MIDI file's own program_change/bank-select messages
+        # for that channel are ignored -- the channel is pinned to this
+        # instrument for the whole song. Applies to both live playback and
+        # offline export.
+        self.channel_overrides = {}
+
+    # -- per-channel instrument overrides -----------------------------------
+    def apply_overrides_now(self, overrides):
+        """Replace the current override set and, if a SoundFont is already
+        loaded, apply it to the live synth immediately (so switching
+        instruments works while a song is playing, for auditioning)."""
+        self.channel_overrides = dict(overrides)
+        if self.synth is not None and self.sfid is not None:
+            self._apply_channel_overrides_to_synth(self.synth, self.sfid, self.channel_overrides)
+
+    @staticmethod
+    def _apply_channel_overrides_to_synth(synth, sfid, overrides):
+        for ch, (bank, preset) in overrides.items():
+            try:
+                synth.program_select(ch, sfid, bank, preset)
+            except Exception:
+                pass
 
     # -- setup ---------------------------------------------------------
     def ensure_synth(self):
@@ -504,6 +618,9 @@ class PlaybackEngine:
                     render_synth.program_select(ch, sfid, 0, 0)
                 except Exception:
                     pass
+            # Re-apply the same per-channel overrides used for live playback,
+            # so an exported file matches what you actually hear.
+            self._apply_channel_overrides_to_synth(render_synth, sfid, self.channel_overrides)
 
             chunks = []
             last_time = 0.0
@@ -560,6 +677,17 @@ class PlaybackEngine:
 
     def _apply_message(self, msg, audible=True, synth=None):
         synth = synth if synth is not None else self.synth
+        ch = getattr(msg, "channel", None)
+
+        # A channel with an override is pinned to that instrument for the
+        # whole song -- ignore the MIDI file's own patch/bank changes on it
+        # so they can't fight the override.
+        if ch is not None and ch in self.channel_overrides:
+            if msg.type == "program_change":
+                return
+            if msg.type == "control_change" and msg.control in (0, 32):
+                return
+
         try:
             if msg.type == "note_on" and audible:
                 if msg.velocity == 0:
@@ -704,6 +832,13 @@ class PlayerApp:
         self._sf_ids = []
         self._midi_ids = []
 
+        # What's actually loaded in the engine right now (not necessarily
+        # what the comboboxes show mid-load) -- used as the key for saving/
+        # restoring per-song-per-SoundFont channel instrument overrides.
+        self._current_sf_id = None
+        self._current_midi_id = None
+        self._preset_cache = {}  # soundfont entry id -> [(bank, preset, name), ...]
+
         self._seeking = False
         self._build_ui()
         self._refresh_soundfont_list(select_last=True)
@@ -778,6 +913,9 @@ class PlayerApp:
         )
         ttk.Button(frm_controls, text="Export...", command=self._open_export_dialog, width=10).grid(
             row=0, column=2, padx=4
+        )
+        ttk.Button(frm_controls, text="Channels...", command=self._open_channel_mixer, width=10).grid(
+            row=0, column=3, padx=4
         )
 
         # -- Volume --
@@ -955,7 +1093,13 @@ class PlayerApp:
             try:
                 self.engine.load_soundfont(path)
                 self.library.set_last("soundfont", entry_id)
-                self.root.after(0, lambda: self.status_var.set(f"Loaded SoundFont: {entry['name']}"))
+
+                def on_success():
+                    self.status_var.set(f"Loaded SoundFont: {entry['name']}")
+                    self._current_sf_id = entry_id
+                    self._maybe_apply_saved_overrides()
+
+                self.root.after(0, on_success)
             except Exception as exc:
                 self.root.after(0, lambda: messagebox.showerror(APP_TITLE, f"Failed to load SoundFont:\n{exc}"))
                 self.root.after(0, lambda: self.status_var.set("Ready."))
@@ -974,8 +1118,20 @@ class PlayerApp:
             self.status_var.set(f"Loaded MIDI: {entry['name']}")
             self.seek_scale.set(0)
             self.time_var.set(f"00:00 / {_fmt_time(self.engine.total_time)}")
+            self._current_midi_id = entry_id
+            self._maybe_apply_saved_overrides()
         except Exception as exc:
             messagebox.showerror(APP_TITLE, f"Failed to load MIDI:\n{exc}")
+
+    def _maybe_apply_saved_overrides(self):
+        """Whenever the loaded SoundFont+MIDI pairing changes, load whatever
+        per-channel overrides were previously saved for that exact pairing
+        (or clear them, if this is a pairing with none saved)."""
+        if self._current_sf_id and self._current_midi_id:
+            overrides = self.library.get_channel_overrides(self._current_midi_id, self._current_sf_id)
+        else:
+            overrides = {}
+        self.engine.apply_overrides_now(overrides)
 
     # -- transport UI -----------------------------------------
     def _toggle_play(self):
@@ -1111,6 +1267,140 @@ class PlayerApp:
                 self.status_var.set(f"Exported: {os.path.basename(save_path)}")
 
             self.root.after(0, finish)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    # -- channel instrument overrides -----------------------------------
+    def _open_channel_mixer(self):
+        if not self.engine.soundfont_path or not self.engine.events:
+            messagebox.showerror(APP_TITLE, "Load both a SoundFont and a MIDI file first.")
+            return
+        if not self._current_sf_id or not self._current_midi_id:
+            messagebox.showerror(APP_TITLE, "Still loading -- try again in a moment.")
+            return
+
+        sf_entry_id = self._current_sf_id
+        midi_entry_id = self._current_midi_id
+
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Channel Instruments")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        dialog.geometry("620x440")
+
+        status_var = tk.StringVar(value="Scanning instruments in the loaded SoundFont...")
+        ttk.Label(dialog, textvariable=status_var, wraplength=580, justify="left").pack(
+            anchor="w", padx=12, pady=(10, 4)
+        )
+
+        container = ttk.Frame(dialog)
+        container.pack(fill="both", expand=True, padx=12, pady=6)
+
+        canvas = tk.Canvas(container, borderwidth=0, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(container, orient="vertical", command=canvas.yview)
+        rows_frame = ttk.Frame(canvas)
+        rows_frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=rows_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+        def on_mousewheel(event):
+            canvas.yview_scroll(-1 * (event.delta // 120), "units")
+        canvas.bind_all("<MouseWheel>", on_mousewheel)
+
+        btn_row = ttk.Frame(dialog)
+        btn_row.pack(pady=(4, 10))
+        ttk.Button(
+            btn_row, text="Reset All to MIDI Defaults",
+            command=lambda: reset_all(),
+        ).pack(side="left", padx=6)
+        ttk.Button(btn_row, text="Close", command=dialog.destroy).pack(side="left", padx=6)
+
+        def on_dialog_close():
+            canvas.unbind_all("<MouseWheel>")
+            dialog.destroy()
+        dialog.protocol("WM_DELETE_WINDOW", on_dialog_close)
+
+        def reset_all():
+            self.library.clear_all_channel_overrides(midi_entry_id, sf_entry_id)
+            self.engine.apply_overrides_now({})
+            for child in rows_frame.winfo_children():
+                child.destroy()
+            build_rows(self._preset_cache.get(sf_entry_id, []))
+
+        def build_rows(presets):
+            for child in rows_frame.winfo_children():
+                child.destroy()
+
+            preset_labels = [f"Bank {b} / Preset {p} — {n}" for b, p, n in presets]
+            preset_lookup = {label: (b, p) for label, (b, p, _n) in zip(preset_labels, presets)}
+
+            channel_programs = summarize_channel_programs(self.engine.events)
+            current_overrides = self.library.get_channel_overrides(midi_entry_id, sf_entry_id)
+
+            if not channel_programs:
+                ttk.Label(rows_frame, text="This MIDI file doesn't use any channels?").pack(padx=8, pady=8)
+
+            for ch in sorted(channel_programs.keys()):
+                bank, program = channel_programs[ch]
+                declared_name = None
+                if self.engine.synth is not None and self.engine.sfid is not None:
+                    try:
+                        declared_name = self.engine.synth.sfpreset_name(self.engine.sfid, bank, program)
+                    except Exception:
+                        declared_name = None
+
+                if declared_name:
+                    declared_label = declared_name
+                elif ch == 9 and bank == 0 and program == 0:
+                    declared_label = "Percussion (channel 10 default)"
+                else:
+                    declared_label = f"Bank {bank} / Preset {program} (not defined in this SoundFont!)"
+
+                row = ttk.Frame(rows_frame)
+                row.pack(fill="x", pady=3, padx=4)
+                ttk.Label(row, text=f"Ch {ch + 1}", width=6).pack(side="left")
+                ttk.Label(row, text=declared_label, width=32, anchor="w").pack(side="left")
+
+                combo = ttk.Combobox(row, state="readonly", width=28, values=["(MIDI default)"] + preset_labels)
+                override = current_overrides.get(ch)
+                matched = False
+                if override:
+                    for label, bp in preset_lookup.items():
+                        if bp == override:
+                            combo.set(label)
+                            matched = True
+                            break
+                if not matched:
+                    combo.current(0)
+                combo.pack(side="left", padx=6)
+
+                def on_change(_event, ch=ch, combo=combo):
+                    label = combo.get()
+                    if label == "(MIDI default)":
+                        self.library.clear_channel_override(midi_entry_id, sf_entry_id, ch)
+                    else:
+                        bank_p, preset_p = preset_lookup[label]
+                        self.library.set_channel_override(midi_entry_id, sf_entry_id, ch, bank_p, preset_p)
+                    overrides = self.library.get_channel_overrides(midi_entry_id, sf_entry_id)
+                    self.engine.apply_overrides_now(overrides)
+
+                combo.bind("<<ComboboxSelected>>", on_change)
+
+            status_var.set(
+                f"{len(presets)} instrument(s) found in this SoundFont. "
+                "Changes apply immediately (even mid-playback) and are remembered "
+                "for this song + SoundFont pairing."
+            )
+
+        def worker():
+            if sf_entry_id in self._preset_cache:
+                presets = self._preset_cache[sf_entry_id]
+            else:
+                presets = enumerate_soundfont_presets(self.engine.synth, self.engine.sfid)
+                self._preset_cache[sf_entry_id] = presets
+            self.root.after(0, build_rows, presets)
 
         threading.Thread(target=worker, daemon=True).start()
 

@@ -138,6 +138,28 @@ always works out of the box. MP3 export uses the `lameenc` library, which
 `build_exe.py`'s `pip install -r requirements.txt` step installs like any
 other dependency -- no separate download needed.
 
+### Fixing wrong-sounding instruments (Channel Instruments)
+
+A MIDI file doesn't contain any actual sound -- it just says things like
+"channel 3, use instrument #40." Your SoundFont is what maps that number to
+an actual sample. If a SoundFont doesn't fully implement the General MIDI
+instrument list (common with smaller, hand-made game SoundFonts), it
+substitutes something else for numbers it doesn't define, which is what
+"wrong instrument" usually is.
+
+Click **Channels...** (needs both a SoundFont and a MIDI loaded first) to see
+every channel the current song uses, what instrument it's defaulting to, and
+a dropdown to pin that channel to a different instrument actually available
+in your loaded SoundFont instead. Changes take effect immediately, even
+mid-playback, so you can audition instruments while the song plays. Each
+change is saved automatically, keyed to this exact song + SoundFont
+pairing -- reload the same two later and your fixes are still there; a
+different SoundFont with the same song (or vice versa) starts with a clean
+slate, since a fix for one SoundFont's instrument list is meaningless for
+another's. "Reset All to MIDI Defaults" clears every override for the
+current pairing. Overrides also apply to Export, so what you hear is what
+gets rendered to WAV/MP3.
+
 ## Troubleshooting
 
 **"FluidSynth could not be loaded" error on startup**
@@ -187,3 +209,10 @@ paid certificate.
   need to hold a huge SoundFont entirely in memory) and checks the file's
   magic bytes as soon as enough of it has arrived, before committing to
   the rest of the download.
+- Channel Instruments works by probing FluidSynth for every (bank, preset)
+  combination that exists in the loaded SoundFont (there's no built-in
+  "list all instruments" call, only "does this one exist") -- cheap enough
+  to do in full every time a new SoundFont is scanned. An override just
+  means "ignore this channel's own program-change/bank-select messages for
+  the rest of the song and stay pinned to this instrument," applied on top
+  of whatever the MIDI file says, for both live playback and export.
