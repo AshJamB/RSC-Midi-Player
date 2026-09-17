@@ -1,0 +1,37 @@
+# --- Your personal library: never commit game assets or your local library ---
+# (RuneScape/Banjo-Kazooie/etc. soundfonts and any MIDIs are copyrighted game
+# assets you sourced yourself -- they don't belong in source control, and this
+# also keeps the repo small.)
+/Soundfonts/
+/Midis/
+library.json
+
+# Belt-and-braces: ignore these file types anywhere in the repo, in case a
+# soundfont/MIDI ever gets dropped somewhere other than the folders above.
+*.sf2
+*.sf3
+*.mid
+*.midi
+
+# --- Build artifacts ---
+# The FluidSynth DLLs build_exe.py downloads automatically -- don't commit
+# binaries, just re-run build_exe.py after cloning.
+/bin/
+/build/
+/dist/
+*.spec
+
+# --- Python ---
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+env/
+*.egg-info/
+
+# --- Editor / OS junk ---
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store

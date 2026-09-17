@@ -1,0 +1,1172 @@
+"""
+RSC MIDI Player
+A portable, standalone media-player-style app for playing MIDI files through
+any SoundFont (.sf2) file -- RuneScape, Banjo-Kazooie, GXSCC 8-bit fonts,
+whatever you've got. No Java required.
+
+Playback is done with FluidSynth (via the pyfluidsynth ctypes bindings) and
+MIDI parsing/timing is done with mido.
+
+The app keeps a small on-disk library (next to the .exe) of every SoundFont
+and MIDI you've ever imported, so you can pick them from dropdowns instead of
+re-browsing your filesystem every time, and it remembers what you last had
+loaded between sessions. See README.md for the folder layout.
+
+Build into a single portable .exe with PyInstaller -- see build_exe.py and
+README.md in this folder for full instructions.
+"""
+
+import ctypes
+import hashlib
+import json
+import os
+import sys
+import tempfile
+import threading
+import time
+import tkinter as tk
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
+import wave
+from tkinter import filedialog, messagebox, simpledialog, ttk
+
+# ---------------------------------------------------------------------------
+# Make sure bundled FluidSynth DLLs (Windows) are found before we import the
+# fluidsynth python bindings. When frozen by PyInstaller, sys._MEIPASS is the
+# temp folder the app was unpacked into; we ship the DLLs there via
+# --add-binary (see build_exe.py). When running from source, we look in a
+# local "bin" folder next to this script.
+# ---------------------------------------------------------------------------
+def _bootstrap_dll_search_path():
+    if getattr(sys, "frozen", False):
+        base_dir = sys._MEIPASS  # type: ignore[attr-defined]
+    else:
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+
+    candidates = [base_dir, os.path.join(base_dir, "bin")]
+    for path in candidates:
+        if os.path.isdir(path):
+            try:
+                os.add_dll_directory(path)  # Windows-only, Python 3.8+
+            except (AttributeError, OSError):
+                pass
+            os.environ["PATH"] = path + os.pathsep + os.environ.get("PATH", "")
+
+
+if sys.platform.startswith("win"):
+    _bootstrap_dll_search_path()
+
+try:
+    import fluidsynth  # pyfluidsynth
+except Exception as exc:  # pragma: no cover - surfaced to the user in the UI
+    fluidsynth = None
+    _FLUIDSYNTH_IMPORT_ERROR = exc
+else:
+    _FLUIDSYNTH_IMPORT_ERROR = None
+
+try:
+    import mido
+except Exception as exc:  # pragma: no cover
+    mido = None
+    _MIDO_IMPORT_ERROR = exc
+else:
+    _MIDO_IMPORT_ERROR = None
+
+try:
+    import numpy as np
+except Exception as exc:  # pragma: no cover
+    np = None
+    _NUMPY_IMPORT_ERROR = exc
+else:
+    _NUMPY_IMPORT_ERROR = None
+
+try:
+    import lameenc
+except Exception as exc:  # pragma: no cover - MP3 export just gets disabled
+    lameenc = None
+    _LAMEENC_IMPORT_ERROR = exc
+else:
+    _LAMEENC_IMPORT_ERROR = None
+
+
+APP_TITLE = "RSC MIDI Player"
+NUM_CHANNELS = 16
+RENDER_SAMPLE_RATE = 44100
+DOWNLOAD_USER_AGENT = "Mozilla/5.0 (compatible; RSC-MIDI-Player/1.0)"
+MIDI_MAGIC = b"MThd"
+
+
+def get_app_dir():
+    """Directory the app's own folder (Soundfonts/, Midis/, library.json)
+    lives next to. This is the folder containing the .exe when frozen, or
+    the folder containing this script when run from source -- NOT the
+    PyInstaller temp extraction dir, so the library survives between runs."""
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def is_sf2_data(data):
+    return len(data) >= 12 and data[0:4] == b"RIFF" and data[8:12] == b"sfbk"
+
+
+def guess_extension_from_url(url, kind):
+    path = urllib.parse.urlparse(url).path
+    ext = os.path.splitext(path)[1].lower()
+    valid = LibraryManager.KINDS[kind]["exts"]
+    if ext in valid:
+        return ext
+    return ".sf2" if kind == "soundfont" else ".mid"
+
+
+def guess_name_from_url(url):
+    path = urllib.parse.urlparse(url).path
+    name = os.path.basename(urllib.parse.unquote(path))
+    name = os.path.splitext(name)[0].strip()
+    return name or "Downloaded file"
+
+
+def download_url_to_file(url, dest_path, kind, progress_cb=None):
+    """Stream-download url to dest_path, validating that the content looks
+    like the expected file type (checked on the first bytes received, before
+    committing to the rest of the download). Raises on failure; cleans up
+    dest_path if validation fails partway through."""
+    req = urllib.request.Request(url, headers={"User-Agent": DOWNLOAD_USER_AGENT})
+    try:
+        resp = urllib.request.urlopen(req, timeout=20)
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(f"Server returned an error: HTTP {exc.code}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"Could not reach that URL: {exc.reason}") from exc
+
+    with resp:
+        total = resp.headers.get("Content-Length")
+        total = int(total) if total and total.isdigit() else None
+        downloaded = 0
+        header_buf = b""
+        checked = False
+
+        with open(dest_path, "wb") as f:
+            while True:
+                chunk = resp.read(256 * 1024)
+                if not chunk:
+                    break
+                if not checked:
+                    header_buf += chunk
+                    if len(header_buf) >= 16:
+                        _validate_magic(header_buf, kind, dest_path)
+                        checked = True
+                f.write(chunk)
+                downloaded += len(chunk)
+                if progress_cb:
+                    progress_cb(downloaded, total)
+
+        if not checked:
+            # File was smaller than our magic-byte check window.
+            _validate_magic(header_buf, kind, dest_path)
+
+
+def _validate_magic(header_buf, kind, dest_path):
+    ok = header_buf.startswith(MIDI_MAGIC) if kind == "midi" else is_sf2_data(header_buf)
+    if not ok:
+        try:
+            os.remove(dest_path)
+        except OSError:
+            pass
+        expected = "a MIDI file (should start with 'MThd')" if kind == "midi" else "an SF2 SoundFont (should be a RIFF/sfbk file)"
+        raise ValueError(f"That link doesn't look like {expected}.")
+
+
+def write_wav_file(path, pcm_bytes, sample_rate=RENDER_SAMPLE_RATE, channels=2, sampwidth=2):
+    with wave.open(path, "wb") as wf:
+        wf.setnchannels(channels)
+        wf.setsampwidth(sampwidth)
+        wf.setframerate(sample_rate)
+        wf.writeframes(pcm_bytes)
+
+
+def write_mp3_file(path, pcm_bytes, sample_rate=RENDER_SAMPLE_RATE, channels=2, bitrate=192):
+    if lameenc is None:
+        raise RuntimeError(f"MP3 export is unavailable: {_LAMEENC_IMPORT_ERROR}")
+    encoder = lameenc.Encoder()
+    encoder.set_bit_rate(bitrate)
+    encoder.set_in_sample_rate(sample_rate)
+    encoder.set_channels(channels)
+    encoder.set_quality(2)  # 2 = highest quality, 7 = fastest
+    data = encoder.encode(pcm_bytes)
+    data += encoder.flush()
+    with open(path, "wb") as f:
+        f.write(data)
+
+
+# ---------------------------------------------------------------------------
+# Library: remembers every SoundFont/MIDI you've imported, copies them into
+# app-local Soundfonts/ and Midis/ folders (deduped by content hash so
+# re-importing the same file twice doesn't waste space), and persists which
+# ones you had selected last.
+# ---------------------------------------------------------------------------
+class LibraryManager:
+    KINDS = {
+        "soundfont": {"folder": "Soundfonts", "exts": (".sf2", ".sf3")},
+        "midi": {"folder": "Midis", "exts": (".mid", ".midi")},
+    }
+
+    def __init__(self, app_dir):
+        self.app_dir = app_dir
+        self.manifest_path = os.path.join(app_dir, "library.json")
+        self.data = {
+            "soundfonts": [],
+            "midis": [],
+            "last_soundfont_id": None,
+            "last_midi_id": None,
+        }
+        for kind in self.KINDS.values():
+            os.makedirs(os.path.join(app_dir, kind["folder"]), exist_ok=True)
+        self._load()
+
+    # -- persistence -------------------------------------------------------
+    def _load(self):
+        if os.path.isfile(self.manifest_path):
+            try:
+                with open(self.manifest_path, "r", encoding="utf-8") as f:
+                    loaded = json.load(f)
+                self.data.update(loaded)
+            except Exception:
+                pass  # corrupt/missing manifest -> start fresh, don't crash
+
+    def save(self):
+        try:
+            with open(self.manifest_path, "w", encoding="utf-8") as f:
+                json.dump(self.data, f, indent=2)
+        except Exception:
+            pass  # non-fatal; worst case we lose the "remember last" feature
+
+    # -- helpers -------------------------------------------------------
+    @staticmethod
+    def _hash_file(path):
+        h = hashlib.sha1()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                h.update(chunk)
+        return h.hexdigest()
+
+    def _entries_key(self, kind):
+        return "soundfonts" if kind == "soundfont" else "midis"
+
+    def list(self, kind):
+        return list(self.data[self._entries_key(kind)])
+
+    def get(self, kind, entry_id):
+        for e in self.data[self._entries_key(kind)]:
+            if e["id"] == entry_id:
+                return e
+        return None
+
+    # -- mutation -------------------------------------------------------
+    def import_file(self, kind, source_path, display_name=None):
+        """Copy source_path into the library (unless an identical file is
+        already there) and return the library entry dict. display_name
+        overrides the name shown in the dropdown (used for links, where
+        source_path is a temp file with a meaningless name)."""
+        info = self.KINDS[kind]
+        digest = self._hash_file(source_path)
+
+        # Dedup: if we already have a file with this exact content, reuse it.
+        for e in self.data[self._entries_key(kind)]:
+            if e.get("hash") == digest:
+                return e
+
+        ext = os.path.splitext(source_path)[1].lower()
+        if ext not in info["exts"]:
+            # Keep original extension anyway if it's something unexpected,
+            # rather than rejecting the import outright.
+            ext = ext or (".sf2" if kind == "soundfont" else ".mid")
+
+        dest_name = f"{uuid.uuid4().hex}{ext}"
+        dest_path = os.path.join(self.app_dir, info["folder"], dest_name)
+
+        with open(source_path, "rb") as src, open(dest_path, "wb") as dst:
+            while True:
+                chunk = src.read(1024 * 1024)
+                if not chunk:
+                    break
+                dst.write(chunk)
+
+        entry = {
+            "id": uuid.uuid4().hex,
+            "name": display_name or os.path.splitext(os.path.basename(source_path))[0],
+            "file": os.path.join(info["folder"], dest_name),
+            "hash": digest,
+            "original_path": source_path,
+        }
+        self.data[self._entries_key(kind)].append(entry)
+        self.save()
+        return entry
+
+    def remove(self, kind, entry_id, delete_file=True):
+        key = self._entries_key(kind)
+        entry = self.get(kind, entry_id)
+        if entry is None:
+            return
+        self.data[key] = [e for e in self.data[key] if e["id"] != entry_id]
+        if delete_file:
+            full = os.path.join(self.app_dir, entry["file"])
+            try:
+                if os.path.isfile(full):
+                    os.remove(full)
+            except Exception:
+                pass
+        if self.data.get(f"last_{kind}_id") == entry_id:
+            self.data[f"last_{kind}_id"] = None
+        self.save()
+
+    def rename(self, kind, entry_id, new_name):
+        entry = self.get(kind, entry_id)
+        if entry:
+            entry["name"] = new_name
+            self.save()
+
+    def full_path(self, kind, entry_id):
+        entry = self.get(kind, entry_id)
+        if entry is None:
+            return None
+        return os.path.join(self.app_dir, entry["file"])
+
+    def set_last(self, kind, entry_id):
+        self.data[f"last_{kind}_id"] = entry_id
+        self.save()
+
+    def get_last(self, kind):
+        return self.data.get(f"last_{kind}_id")
+
+
+class PlaybackEngine:
+    """Owns the FluidSynth synth and drives MIDI playback on a worker thread."""
+
+    def __init__(self, on_position_update, on_finished):
+        self.on_position_update = on_position_update
+        self.on_finished = on_finished
+
+        self.synth = None
+        self.sfid = None
+        self.soundfont_path = None
+
+        self.events = []          # list of (abs_time_seconds, mido.Message)
+        self.total_time = 0.0
+        self.midi_path = None
+
+        self._thread = None
+        self._stop_flag = threading.Event()
+        self._pause_flag = threading.Event()  # set == paused
+        self._seek_target = None
+        self._lock = threading.Lock()
+        self._gain = 0.5  # 0.0 - 2.0
+
+    # -- setup ---------------------------------------------------------
+    def ensure_synth(self):
+        if self.synth is None:
+            self.synth = fluidsynth.Synth(samplerate=44100.0)
+            driver = "dsound" if sys.platform.startswith("win") else None
+            try:
+                self.synth.start(driver=driver) if driver else self.synth.start()
+            except Exception:
+                # Fall back to letting fluidsynth pick a driver automatically.
+                self.synth.start()
+            self._apply_gain()
+
+    def _apply_gain(self):
+        """Set the synth's master gain. pyfluidsynth >=1.4 dropped the old
+        set_gain() convenience method in favor of the generic setting()
+        call; older versions only have set_gain(). Support both."""
+        if self.synth is None:
+            return
+        try:
+            self.synth.setting("synth.gain", self._gain)
+        except Exception:
+            try:
+                self.synth.set_gain(self._gain)
+            except Exception:
+                pass
+
+    def load_soundfont(self, path):
+        self.ensure_synth()
+        sfid = self.synth.sfload(path)
+        if sfid == -1:
+            raise RuntimeError("FluidSynth could not load that SoundFont file.")
+        # Replace any previously loaded font.
+        if self.sfid is not None:
+            try:
+                self.synth.sfunload(self.sfid)
+            except Exception:
+                pass
+        self.sfid = sfid
+        self.soundfont_path = path
+        for ch in range(NUM_CHANNELS):
+            try:
+                self.synth.program_select(ch, self.sfid, 0, 0)
+            except Exception:
+                pass
+
+    def load_midi(self, path):
+        if mido is None:
+            raise RuntimeError(f"mido is not available: {_MIDO_IMPORT_ERROR}")
+        midi_file = mido.MidiFile(path)
+        events = []
+        t = 0.0
+        for msg in midi_file:  # mido resolves tempo + ticks -> real seconds here
+            t += msg.time
+            if not msg.is_meta:
+                events.append((t, msg))
+        self.events = events
+        self.total_time = t
+        self.midi_path = path
+
+    # -- transport -------------------------------------------------------
+    def play(self):
+        if self.synth is None or self.sfid is None:
+            raise RuntimeError("Load a SoundFont first.")
+        if not self.events:
+            raise RuntimeError("Load a MIDI file first.")
+
+        if self._thread and self._thread.is_alive():
+            # Already running -- just unpause.
+            self._pause_flag.clear()
+            return
+
+        self._stop_flag.clear()
+        self._pause_flag.clear()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def pause(self):
+        self._pause_flag.set()
+
+    def resume(self):
+        self._pause_flag.clear()
+
+    def is_paused(self):
+        return self._pause_flag.is_set()
+
+    def is_playing(self):
+        return bool(self._thread and self._thread.is_alive())
+
+    def stop(self):
+        self._stop_flag.set()
+        self._pause_flag.clear()
+        if self._thread:
+            self._thread.join(timeout=2.0)
+        self._all_notes_off()
+
+    def seek(self, target_seconds):
+        with self._lock:
+            self._seek_target = max(0.0, min(target_seconds, self.total_time))
+
+    def set_volume(self, value_0_to_100):
+        self._gain = max(0.0, min(2.0, (value_0_to_100 / 100.0) * 2.0))
+        self._apply_gain()
+
+    def shutdown(self):
+        self.stop()
+        if self.synth is not None:
+            try:
+                self.synth.delete()
+            except Exception:
+                pass
+            self.synth = None
+
+    # -- offline rendering (export) -----------------------------------------
+    def render_offline(self, progress_cb=None, cancel_check=None):
+        """Render the currently loaded SoundFont+MIDI to raw 16-bit stereo
+        PCM at RENDER_SAMPLE_RATE, entirely offline (no audio device, no
+        real-time waiting) using a throwaway Synth so it never touches live
+        playback state. Returns (pcm_bytes, sample_rate), or (None, None) if
+        cancelled. progress_cb, if given, is called with a float in [0, 1]."""
+        if not self.soundfont_path:
+            raise RuntimeError("Load a SoundFont first.")
+        if not self.events:
+            raise RuntimeError("Load a MIDI file first.")
+        if np is None:
+            raise RuntimeError(f"numpy is unavailable: {_NUMPY_IMPORT_ERROR}")
+
+        sample_rate = RENDER_SAMPLE_RATE
+        render_synth = fluidsynth.Synth(samplerate=float(sample_rate))
+        # Deliberately NOT calling render_synth.start() -- we only want
+        # get_samples() offline rendering, never a live audio device, so this
+        # can safely run concurrently with (or without) real playback.
+        try:
+            sfid = render_synth.sfload(self.soundfont_path)
+            if sfid == -1:
+                raise RuntimeError("FluidSynth could not (re)load the SoundFont for export.")
+            for ch in range(NUM_CHANNELS):
+                try:
+                    render_synth.program_select(ch, sfid, 0, 0)
+                except Exception:
+                    pass
+
+            chunks = []
+            last_time = 0.0
+            total = self.total_time or 1.0
+            n_events = len(self.events)
+
+            for i, (abs_t, msg) in enumerate(self.events):
+                if cancel_check and cancel_check():
+                    return None, None
+                gap = abs_t - last_time
+                if gap > 0:
+                    n = int(round(gap * sample_rate))
+                    if n > 0:
+                        chunks.append(render_synth.get_samples(n))
+                self._apply_message(msg, audible=True, synth=render_synth)
+                last_time = abs_t
+                if progress_cb and (i % 100 == 0 or i == n_events - 1):
+                    progress_cb(min(0.97, abs_t / total))
+
+            # A couple seconds of tail so reverb/release isn't cut off abruptly.
+            tail_samples = sample_rate * 2
+            chunks.append(render_synth.get_samples(tail_samples))
+        finally:
+            try:
+                render_synth.delete()
+            except Exception:
+                pass
+
+        if progress_cb:
+            progress_cb(1.0)
+
+        pcm = np.concatenate(chunks) if chunks else np.zeros(0, dtype=np.int16)
+        return pcm.astype(np.int16).tobytes(), sample_rate
+
+    # -- internals ---------------------------------------------------------
+    def _all_notes_off(self):
+        if self.synth is None:
+            return
+        for ch in range(NUM_CHANNELS):
+            try:
+                self.synth.cc(ch, 123, 0)  # all notes off
+                self.synth.cc(ch, 120, 0)  # all sound off
+            except Exception:
+                pass
+
+    def _replay_state_only(self, up_to_time):
+        """Fast-forward non-audible state (program/control/pitch) up to a time,
+        without actually sounding notes, so a seek lands with correct
+        instrument/patch/pan/etc. Skips note_on/note_off."""
+        for abs_t, msg in self.events:
+            if abs_t > up_to_time:
+                break
+            self._apply_message(msg, audible=False)
+
+    def _apply_message(self, msg, audible=True, synth=None):
+        synth = synth if synth is not None else self.synth
+        try:
+            if msg.type == "note_on" and audible:
+                if msg.velocity == 0:
+                    synth.noteoff(msg.channel, msg.note)
+                else:
+                    synth.noteon(msg.channel, msg.note, msg.velocity)
+            elif msg.type == "note_off" and audible:
+                synth.noteoff(msg.channel, msg.note)
+            elif msg.type == "control_change":
+                synth.cc(msg.channel, msg.control, msg.value)
+            elif msg.type == "program_change":
+                synth.program_change(msg.channel, msg.program)
+            elif msg.type == "pitchwheel":
+                synth.pitch_bend(msg.channel, msg.pitch)
+            elif msg.type == "aftertouch":
+                pass
+            elif msg.type == "polytouch":
+                pass
+        except Exception:
+            pass
+
+    def _run(self):
+        idx = 0
+        n = len(self.events)
+        start_wall = time.monotonic()
+        start_pos = 0.0
+        paused_accum = 0.0
+
+        while idx < n and not self._stop_flag.is_set():
+            # Handle a pending seek request.
+            with self._lock:
+                seek_to = self._seek_target
+                self._seek_target = None
+            if seek_to is not None:
+                self._all_notes_off()
+                self._replay_state_only(seek_to)
+                idx = 0
+                while idx < n and self.events[idx][0] < seek_to:
+                    idx += 1
+                start_wall = time.monotonic()
+                start_pos = seek_to
+                paused_accum = 0.0
+
+            if self._pause_flag.is_set():
+                pause_started = time.monotonic()
+                while self._pause_flag.is_set() and not self._stop_flag.is_set():
+                    time.sleep(0.05)
+                    with self._lock:
+                        if self._seek_target is not None:
+                            break
+                paused_accum += time.monotonic() - pause_started
+                continue
+
+            abs_t, msg = self.events[idx]
+            elapsed = (time.monotonic() - start_wall - paused_accum) + start_pos
+            wait = abs_t - elapsed
+            if wait > 0:
+                time.sleep(min(wait, 0.05))
+                continue
+
+            self._apply_message(msg, audible=True)
+            idx += 1
+
+            now_pos = abs_t
+            self.on_position_update(now_pos, self.total_time)
+
+        self._all_notes_off()
+        if not self._stop_flag.is_set():
+            self.on_finished()
+
+
+class ProgressDialog(tk.Toplevel):
+    """Small modal window with a progress bar + status label, used for both
+    downloads (byte counts) and offline export rendering (percentage)."""
+
+    def __init__(self, parent, title, allow_cancel=False, on_cancel=None):
+        super().__init__(parent)
+        self.title(title)
+        self.resizable(False, False)
+        self.transient(parent)
+        self.protocol("WM_DELETE_WINDOW", lambda: None)  # no closing via the X
+
+        self.status_var = tk.StringVar(value=title)
+        ttk.Label(self, textvariable=self.status_var, width=46).pack(padx=16, pady=(16, 8))
+
+        self.bar = ttk.Progressbar(self, orient="horizontal", length=320, mode="determinate", maximum=100)
+        self.bar.pack(padx=16, pady=(0, 12))
+
+        if allow_cancel:
+            ttk.Button(self, text="Cancel", command=on_cancel).pack(pady=(0, 14))
+        else:
+            ttk.Frame(self, height=6).pack()
+
+        self.update_idletasks()
+        x = parent.winfo_rootx() + (parent.winfo_width() // 2) - (self.winfo_width() // 2)
+        y = parent.winfo_rooty() + (parent.winfo_height() // 2) - (self.winfo_height() // 2)
+        self.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+        self.grab_set()
+
+    def set_fraction(self, frac):
+        self.bar.config(mode="determinate")
+        self.bar["value"] = max(0.0, min(1.0, frac)) * 100.0
+
+    def set_status(self, text):
+        self.status_var.set(text)
+
+    def close(self):
+        try:
+            self.grab_release()
+            self.destroy()
+        except Exception:
+            pass
+
+
+class DownloadProgressDialog(ProgressDialog):
+    def update_progress(self, downloaded, total):
+        mb = downloaded / (1024 * 1024)
+        if total:
+            self.set_fraction(downloaded / total)
+            self.set_status(f"{self.status_var.get().split(chr(10))[0]}\n{mb:.1f} MB / {total / (1024*1024):.1f} MB")
+        else:
+            self.bar.config(mode="indeterminate")
+            self.bar.step(2)
+            self.set_status(f"{self.status_var.get().split(chr(10))[0]}\n{mb:.1f} MB downloaded")
+
+
+class PlayerApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title(APP_TITLE)
+        self.root.geometry("600x360")
+        self.root.resizable(False, False)
+
+        self.app_dir = get_app_dir()
+        self.library = LibraryManager(self.app_dir)
+        self.engine = PlaybackEngine(self._on_position_update, self._on_finished)
+
+        self.time_var = tk.StringVar(value="00:00 / 00:00")
+        self.status_var = tk.StringVar(value="Ready.")
+
+        # id lists kept in parallel with combobox display strings
+        self._sf_ids = []
+        self._midi_ids = []
+
+        self._seeking = False
+        self._build_ui()
+        self._refresh_soundfont_list(select_last=True)
+        self._refresh_midi_list(select_last=True)
+
+        if fluidsynth is None:
+            messagebox.showerror(
+                APP_TITLE,
+                "FluidSynth could not be loaded.\n\n"
+                f"{_FLUIDSYNTH_IMPORT_ERROR}\n\n"
+                "Make sure fluidsynth DLLs are present next to the program "
+                "(see README.md).",
+            )
+
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _build_ui(self):
+        pad = {"padx": 10, "pady": 6}
+
+        # -- SoundFont row --
+        frm_sf = ttk.LabelFrame(self.root, text="SoundFont")
+        frm_sf.pack(fill="x", **pad)
+        self.sf_combo = ttk.Combobox(frm_sf, state="readonly", width=28)
+        self.sf_combo.grid(row=0, column=0, padx=(8, 4), pady=8, sticky="w")
+        self.sf_combo.bind("<<ComboboxSelected>>", self._on_soundfont_selected)
+        ttk.Button(frm_sf, text="Import...", command=self._import_soundfont).grid(
+            row=0, column=1, padx=4
+        )
+        ttk.Button(frm_sf, text="Add via Link...", command=lambda: self._import_via_link("soundfont")).grid(
+            row=0, column=2, padx=4
+        )
+        ttk.Button(frm_sf, text="Remove", command=self._remove_soundfont).grid(
+            row=0, column=3, padx=(4, 8)
+        )
+
+        # -- MIDI row --
+        frm_midi = ttk.LabelFrame(self.root, text="MIDI")
+        frm_midi.pack(fill="x", **pad)
+        self.midi_combo = ttk.Combobox(frm_midi, state="readonly", width=28)
+        self.midi_combo.grid(row=0, column=0, padx=(8, 4), pady=8, sticky="w")
+        self.midi_combo.bind("<<ComboboxSelected>>", self._on_midi_selected)
+        ttk.Button(frm_midi, text="Import...", command=self._import_midi).grid(
+            row=0, column=1, padx=4
+        )
+        ttk.Button(frm_midi, text="Add via Link...", command=lambda: self._import_via_link("midi")).grid(
+            row=0, column=2, padx=4
+        )
+        ttk.Button(frm_midi, text="Remove", command=self._remove_midi).grid(
+            row=0, column=3, padx=(4, 8)
+        )
+
+        # -- Seek --
+        frm_seek = ttk.Frame(self.root)
+        frm_seek.pack(fill="x", **pad)
+        self.seek_scale = ttk.Scale(
+            frm_seek, from_=0, to=1000, orient="horizontal",
+            command=self._on_seek_drag,
+        )
+        self.seek_scale.pack(fill="x")
+        self.seek_scale.bind("<ButtonPress-1>", lambda e: setattr(self, "_seeking", True))
+        self.seek_scale.bind("<ButtonRelease-1>", self._on_seek_release)
+
+        ttk.Label(self.root, textvariable=self.time_var).pack()
+
+        # -- Transport --
+        frm_controls = ttk.Frame(self.root)
+        frm_controls.pack(**pad)
+        self.play_btn = ttk.Button(frm_controls, text="Play", command=self._toggle_play, width=10)
+        self.play_btn.grid(row=0, column=0, padx=4)
+        ttk.Button(frm_controls, text="Stop", command=self._stop, width=10).grid(
+            row=0, column=1, padx=4
+        )
+        ttk.Button(frm_controls, text="Export...", command=self._open_export_dialog, width=10).grid(
+            row=0, column=2, padx=4
+        )
+
+        # -- Volume --
+        frm_vol = ttk.Frame(self.root)
+        frm_vol.pack(fill="x", **pad)
+        ttk.Label(frm_vol, text="Volume").pack(side="left")
+        self.vol_scale = ttk.Scale(
+            frm_vol, from_=0, to=100, orient="horizontal", command=self._on_volume
+        )
+        self.vol_scale.set(50)
+        self.vol_scale.pack(side="left", fill="x", expand=True, padx=8)
+
+        ttk.Label(self.root, textvariable=self.status_var, foreground="#555").pack(
+            side="bottom", fill="x", padx=10, pady=(0, 8)
+        )
+
+    # -- library-backed dropdowns -----------------------------------------
+    def _refresh_soundfont_list(self, select_last=False):
+        entries = self.library.list("soundfont")
+        self._sf_ids = [e["id"] for e in entries]
+        self.sf_combo["values"] = [e["name"] for e in entries]
+        if select_last:
+            last_id = self.library.get_last("soundfont")
+            if last_id in self._sf_ids:
+                idx = self._sf_ids.index(last_id)
+                self.sf_combo.current(idx)
+                self._load_soundfont_by_id(last_id, is_startup=True)
+
+    def _refresh_midi_list(self, select_last=False):
+        entries = self.library.list("midi")
+        self._midi_ids = [e["id"] for e in entries]
+        self.midi_combo["values"] = [e["name"] for e in entries]
+        if select_last:
+            last_id = self.library.get_last("midi")
+            if last_id in self._midi_ids:
+                idx = self._midi_ids.index(last_id)
+                self.midi_combo.current(idx)
+                self._load_midi_by_id(last_id, is_startup=True)
+
+    # -- import / remove -----------------------------------------
+    def _import_soundfont(self):
+        path = filedialog.askopenfilename(
+            title="Select a SoundFont",
+            filetypes=[("SoundFont files", "*.sf2 *.sf3"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        entry = self.library.import_file("soundfont", path)
+        self._refresh_soundfont_list(select_last=False)
+        idx = self._sf_ids.index(entry["id"])
+        self.sf_combo.current(idx)
+        self._load_soundfont_by_id(entry["id"])
+
+    def _import_midi(self):
+        path = filedialog.askopenfilename(
+            title="Select a MIDI file",
+            filetypes=[("MIDI files", "*.mid *.midi"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        entry = self.library.import_file("midi", path)
+        self._refresh_midi_list(select_last=False)
+        idx = self._midi_ids.index(entry["id"])
+        self.midi_combo.current(idx)
+        self._load_midi_by_id(entry["id"])
+
+    def _import_via_link(self, kind):
+        label = "SoundFont" if kind == "soundfont" else "MIDI"
+        url = simpledialog.askstring(
+            APP_TITLE,
+            f"Paste a direct download link to a {label} file:",
+            parent=self.root,
+        )
+        if not url:
+            return
+        url = url.strip()
+        if not (url.startswith("http://") or url.startswith("https://")):
+            messagebox.showerror(APP_TITLE, "That doesn't look like a valid http(s) link.")
+            return
+
+        display_name = guess_name_from_url(url)
+        ext = guess_extension_from_url(url, kind)
+        fd, temp_path = tempfile.mkstemp(suffix=ext, prefix="rscmp_dl_")
+        os.close(fd)
+
+        progress = DownloadProgressDialog(self.root, f"Downloading {label}...")
+
+        def on_progress(downloaded, total):
+            self.root.after(0, progress.update_progress, downloaded, total)
+
+        def worker():
+            try:
+                download_url_to_file(url, temp_path, kind, progress_cb=on_progress)
+                entry = self.library.import_file(kind, temp_path, display_name=display_name)
+            except Exception as exc:
+                self.root.after(0, progress.close)
+                self.root.after(0, lambda: messagebox.showerror(APP_TITLE, f"Download failed:\n{exc}"))
+                return
+            finally:
+                try:
+                    if os.path.isfile(temp_path):
+                        os.remove(temp_path)
+                except OSError:
+                    pass
+
+            def finish():
+                progress.close()
+                if kind == "soundfont":
+                    self._refresh_soundfont_list(select_last=False)
+                    idx = self._sf_ids.index(entry["id"])
+                    self.sf_combo.current(idx)
+                    self._load_soundfont_by_id(entry["id"])
+                else:
+                    self._refresh_midi_list(select_last=False)
+                    idx = self._midi_ids.index(entry["id"])
+                    self.midi_combo.current(idx)
+                    self._load_midi_by_id(entry["id"])
+
+            self.root.after(0, finish)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _remove_soundfont(self):
+        sel = self.sf_combo.current()
+        if sel < 0:
+            return
+        entry_id = self._sf_ids[sel]
+        entry = self.library.get("soundfont", entry_id)
+        if not messagebox.askyesno(
+            APP_TITLE, f"Remove '{entry['name']}' from your library?\n\n"
+            "This deletes the copy stored in the Soundfonts folder."
+        ):
+            return
+        self.library.remove("soundfont", entry_id)
+        self.sf_combo.set("")
+        self._refresh_soundfont_list(select_last=False)
+
+    def _remove_midi(self):
+        sel = self.midi_combo.current()
+        if sel < 0:
+            return
+        entry_id = self._midi_ids[sel]
+        entry = self.library.get("midi", entry_id)
+        if not messagebox.askyesno(
+            APP_TITLE, f"Remove '{entry['name']}' from your library?\n\n"
+            "This deletes the copy stored in the Midis folder."
+        ):
+            return
+        self.library.remove("midi", entry_id)
+        self.midi_combo.set("")
+        self._refresh_midi_list(select_last=False)
+
+    # -- selection handlers -----------------------------------------
+    def _on_soundfont_selected(self, _event):
+        sel = self.sf_combo.current()
+        if sel < 0:
+            return
+        self._load_soundfont_by_id(self._sf_ids[sel])
+
+    def _on_midi_selected(self, _event):
+        sel = self.midi_combo.current()
+        if sel < 0:
+            return
+        self._load_midi_by_id(self._midi_ids[sel])
+
+    def _load_soundfont_by_id(self, entry_id, is_startup=False):
+        path = self.library.full_path("soundfont", entry_id)
+        entry = self.library.get("soundfont", entry_id)
+        if path is None or not os.path.isfile(path):
+            messagebox.showerror(APP_TITLE, "That library file is missing on disk.")
+            return
+        self.status_var.set(f"Loading SoundFont: {entry['name']}...")
+
+        def worker():
+            try:
+                self.engine.load_soundfont(path)
+                self.library.set_last("soundfont", entry_id)
+                self.root.after(0, lambda: self.status_var.set(f"Loaded SoundFont: {entry['name']}"))
+            except Exception as exc:
+                self.root.after(0, lambda: messagebox.showerror(APP_TITLE, f"Failed to load SoundFont:\n{exc}"))
+                self.root.after(0, lambda: self.status_var.set("Ready."))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _load_midi_by_id(self, entry_id, is_startup=False):
+        path = self.library.full_path("midi", entry_id)
+        entry = self.library.get("midi", entry_id)
+        if path is None or not os.path.isfile(path):
+            messagebox.showerror(APP_TITLE, "That library file is missing on disk.")
+            return
+        try:
+            self.engine.load_midi(path)
+            self.library.set_last("midi", entry_id)
+            self.status_var.set(f"Loaded MIDI: {entry['name']}")
+            self.seek_scale.set(0)
+            self.time_var.set(f"00:00 / {_fmt_time(self.engine.total_time)}")
+        except Exception as exc:
+            messagebox.showerror(APP_TITLE, f"Failed to load MIDI:\n{exc}")
+
+    # -- transport UI -----------------------------------------
+    def _toggle_play(self):
+        try:
+            if self.engine.is_playing() and not self.engine.is_paused():
+                self.engine.pause()
+                self.play_btn.config(text="Play")
+                self.status_var.set("Paused.")
+            elif self.engine.is_playing() and self.engine.is_paused():
+                self.engine.resume()
+                self.play_btn.config(text="Pause")
+                self.status_var.set("Playing.")
+            else:
+                self.engine.play()
+                self.play_btn.config(text="Pause")
+                self.status_var.set("Playing.")
+        except Exception as exc:
+            messagebox.showerror(APP_TITLE, str(exc))
+
+    def _stop(self):
+        self.engine.stop()
+        self.play_btn.config(text="Play")
+        self.seek_scale.set(0)
+        total = self.engine.total_time
+        self.time_var.set(f"00:00 / {_fmt_time(total)}")
+        self.status_var.set("Stopped.")
+
+    def _open_export_dialog(self):
+        if not self.engine.soundfont_path:
+            messagebox.showerror(APP_TITLE, "Load a SoundFont first.")
+            return
+        if not self.engine.events:
+            messagebox.showerror(APP_TITLE, "Load a MIDI file first.")
+            return
+
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Export")
+        dialog.resizable(False, False)
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        pad = {"padx": 16, "pady": 6}
+        fmt_var = tk.StringVar(value="wav")
+        bitrate_var = tk.StringVar(value="192")
+
+        ttk.Label(dialog, text="Export current SoundFont + MIDI as:").pack(anchor="w", **pad)
+
+        frm_fmt = ttk.Frame(dialog)
+        frm_fmt.pack(anchor="w", padx=16)
+        ttk.Radiobutton(frm_fmt, text="WAV (uncompressed)", value="wav", variable=fmt_var,
+                         command=lambda: on_fmt_change()).pack(anchor="w")
+        mp3_state = "normal" if lameenc is not None else "disabled"
+        ttk.Radiobutton(frm_fmt, text="MP3", value="mp3", variable=fmt_var,
+                         command=lambda: on_fmt_change(), state=mp3_state).pack(anchor="w")
+        if lameenc is None:
+            ttk.Label(frm_fmt, text="(MP3 unavailable: lameenc not installed)", foreground="#a00").pack(anchor="w")
+
+        frm_bitrate = ttk.Frame(dialog)
+        frm_bitrate.pack(anchor="w", **pad)
+        bitrate_label = ttk.Label(frm_bitrate, text="Bitrate:")
+        bitrate_label.pack(side="left")
+        bitrate_combo = ttk.Combobox(
+            frm_bitrate, textvariable=bitrate_var, state="readonly", width=8,
+            values=["128", "192", "256", "320"],
+        )
+        bitrate_combo.pack(side="left", padx=8)
+
+        def on_fmt_change():
+            enabled = fmt_var.get() == "mp3"
+            state = "readonly" if enabled else "disabled"
+            bitrate_combo.config(state=state)
+
+        on_fmt_change()
+
+        frm_buttons = ttk.Frame(dialog)
+        frm_buttons.pack(pady=(6, 16))
+
+        def do_export():
+            fmt = fmt_var.get()
+            ext = ".mp3" if fmt == "mp3" else ".wav"
+            filetypes = [("MP3 audio", "*.mp3")] if fmt == "mp3" else [("WAV audio", "*.wav")]
+            save_path = filedialog.asksaveasfilename(
+                title="Export as",
+                defaultextension=ext,
+                filetypes=filetypes + [("All files", "*.*")],
+            )
+            if not save_path:
+                return
+            bitrate = int(bitrate_var.get())
+            dialog.destroy()
+            self._run_export(fmt, save_path, bitrate)
+
+        ttk.Button(frm_buttons, text="Export...", command=do_export).pack(side="left", padx=6)
+        ttk.Button(frm_buttons, text="Cancel", command=dialog.destroy).pack(side="left", padx=6)
+
+        dialog.update_idletasks()
+        x = self.root.winfo_rootx() + (self.root.winfo_width() // 2) - (dialog.winfo_width() // 2)
+        y = self.root.winfo_rooty() + (self.root.winfo_height() // 2) - (dialog.winfo_height() // 2)
+        dialog.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+
+    def _run_export(self, fmt, save_path, bitrate):
+        cancel_event = threading.Event()
+        progress = ProgressDialog(
+            self.root, "Rendering audio...", allow_cancel=True,
+            on_cancel=cancel_event.set,
+        )
+
+        def progress_cb(frac):
+            self.root.after(0, progress.set_fraction, frac)
+
+        def worker():
+            try:
+                pcm, sample_rate = self.engine.render_offline(
+                    progress_cb=progress_cb, cancel_check=cancel_event.is_set
+                )
+                if pcm is None:
+                    self.root.after(0, progress.close)
+                    self.root.after(0, lambda: self.status_var.set("Export cancelled."))
+                    return
+
+                self.root.after(0, progress.set_status, "Encoding...")
+                if fmt == "mp3":
+                    write_mp3_file(save_path, pcm, sample_rate=sample_rate, bitrate=bitrate)
+                else:
+                    write_wav_file(save_path, pcm, sample_rate=sample_rate)
+            except Exception as exc:
+                self.root.after(0, progress.close)
+                self.root.after(0, lambda: messagebox.showerror(APP_TITLE, f"Export failed:\n{exc}"))
+                return
+
+            def finish():
+                progress.close()
+                self.status_var.set(f"Exported: {os.path.basename(save_path)}")
+
+            self.root.after(0, finish)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_seek_drag(self, _value):
+        pass  # actual seek happens on release, see below
+
+    def _on_seek_release(self, _event):
+        self._seeking = False
+        if self.engine.total_time <= 0:
+            return
+        frac = self.seek_scale.get() / 1000.0
+        target = frac * self.engine.total_time
+        self.engine.seek(target)
+
+    def _on_volume(self, value):
+        self.engine.set_volume(float(value))
+
+    # -- engine callbacks (called from worker thread -> marshal to UI thread)
+    def _on_position_update(self, pos, total):
+        self.root.after(0, self._update_time_label, pos, total)
+
+    def _update_time_label(self, pos, total):
+        if self._seeking:
+            return
+        self.time_var.set(f"{_fmt_time(pos)} / {_fmt_time(total)}")
+        if total > 0:
+            self.seek_scale.set((pos / total) * 1000.0)
+
+    def _on_finished(self):
+        self.root.after(0, self._handle_finished)
+
+    def _handle_finished(self):
+        self.play_btn.config(text="Play")
+        self.status_var.set("Finished.")
+
+    def _on_close(self):
+        self.engine.shutdown()
+        self.root.destroy()
+
+
+def _fmt_time(seconds):
+    seconds = max(0, int(seconds))
+    return f"{seconds // 60:02d}:{seconds % 60:02d}"
+
+
+def main():
+    root = tk.Tk()
+    try:
+        style = ttk.Style(root)
+        if sys.platform.startswith("win"):
+            style.theme_use("vista")
+    except Exception:
+        pass
+    app = PlayerApp(root)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()

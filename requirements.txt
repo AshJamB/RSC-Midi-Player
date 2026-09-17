@@ -1,0 +1,4 @@
+pyfluidsynth>=1.3.2
+mido>=1.3.0
+pyinstaller>=6.11
+lameenc>=1.5

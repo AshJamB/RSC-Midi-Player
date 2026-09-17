@@ -1,0 +1,189 @@
+# RSC MIDI Player
+
+A simple, portable, media-player-style app for playing MIDI files through any
+SoundFont (.sf2) -- RuneScape, Banjo-Kazooie, GXSCC 8-bit fonts, whatever
+you've collected. No Java, no hunting through someone else's GitHub repo for
+a bundled font -- you load your own SoundFonts and MIDI files, and it
+remembers them for next time.
+
+## What's in this folder
+
+- `rsc_midi_player.py` - the whole app (Tkinter GUI + FluidSynth playback engine)
+- `requirements.txt` - Python packages needed
+- `build_exe.py` - packages the app into a single portable `.exe`
+- `README.md` - this file
+
+## Important: building the .exe must happen on Windows
+
+PyInstaller (the tool that turns the Python script into a `.exe`) does not
+cross-compile. It has to be run on the same OS you're targeting. So to get a
+Windows `.exe`, you'll run the build step yourself on your Windows machine --
+it only takes a few minutes and the steps below are copy-paste.
+
+You can also just run `python rsc_midi_player.py` directly on Windows without
+ever building an exe, if you're comfortable having Python installed.
+
+## Step 1: Install Python (if you don't have it)
+
+Download Python 3.10 or newer from https://python.org (check "Add python.exe
+to PATH" during install).
+
+## Step 2: Install the Python dependencies
+
+Open PowerShell in this folder and run:
+
+```
+pip install -r requirements.txt
+```
+
+## Step 3: Build the exe
+
+```
+python build_exe.py
+```
+
+The app uses FluidSynth (a free, open-source SoundFont synthesizer) under the
+hood for actual audio playback. `build_exe.py` fetches the FluidSynth engine
+DLLs for you automatically -- straight from FluidSynth's official GitHub
+releases (https://github.com/FluidSynth/fluidsynth/releases) -- into a `bin`
+folder next to the script, then bundles them into the exe. You don't need to
+find or download anything by hand. (If it ever can't reach GitHub, it'll
+tell you and you can download the win10-x64 zip yourself and unzip its DLLs
+into a `bin` folder next to `rsc_midi_player.py`.)
+
+When it finishes, your portable app will be at:
+
+```
+dist\RSC-MIDI-Player.exe
+```
+
+Copy that one file to wherever you want to keep the app -- e.g. a dedicated
+folder like `C:\Apps\RSC MIDI Player\`. That location matters a bit now (see
+below), so pick somewhere you're happy for it to live and create its
+sidecar folders.
+
+## Your SoundFont/MIDI library -- how it's stored
+
+The app remembers every SoundFont and MIDI you import, so you can pick them
+from dropdowns instead of re-browsing your filesystem each time, and it
+reopens with whatever you last had loaded.
+
+Everything is kept **next to the .exe**, self-contained, nothing written
+anywhere else on your system:
+
+```
+RSC MIDI Player\
+  RSC-MIDI-Player.exe
+  library.json          <- index of everything you've imported + last-used selection
+  Soundfonts\           <- your imported .sf2/.sf3 files live here
+  Midis\                <- your imported .mid files live here
+```
+
+When you click **Import...** for a SoundFont or MIDI, the app copies the file
+into `Soundfonts\` or `Midis\` (so playback keeps working even if you later
+move, rename, or delete the original file you imported from). If you import
+the exact same file content twice, it recognizes the duplicate and reuses the
+existing copy instead of storing it twice.
+
+**To fully uninstall / clean up:** just delete the whole `RSC MIDI Player`
+folder (exe + `library.json` + `Soundfonts\` + `Midis\`). Nothing is written
+to `%APPDATA%`, the registry, or anywhere else on the system, so there's
+nothing left behind elsewhere.
+
+**If you move the exe** to a different folder, take the whole folder with it
+(the sidecar files travel together) -- that's what makes it portable. If you
+only copy the `.exe` on its own, it will just start a fresh, empty library
+next to wherever you put it.
+
+Use the **Remove** button next to each dropdown to delete an entry from your
+library (this also deletes its copied file from `Soundfonts\`/`Midis\`).
+
+## Using the app
+
+1. Open `RSC-MIDI-Player.exe`.
+2. Click **Import...** next to SoundFont and pick a `.sf2`/`.sf3` file (do
+   this once per soundfont -- next time it'll just be in the dropdown), or
+   click **Add via Link...** and paste a direct download URL to have the app
+   fetch it for you.
+3. Do the same for MIDI: **Import...** for a local `.mid` file, or
+   **Add via Link...** to download one from a URL.
+4. Pick from the dropdowns any time to switch between soundfonts/MIDIs
+   you've already imported.
+5. Click **Play**. Use the seek bar to jump around, and the volume slider to
+   adjust loudness.
+6. Click **Export...** to render the currently loaded SoundFont+MIDI
+   combination out to a `.wav` or `.mp3` file -- pick a format (and bitrate,
+   for MP3), choose where to save, and the app renders it in the background
+   (this is offline rendering, done in one fast pass -- it does not play the
+   file out loud while exporting, and normally finishes well before the
+   track's actual runtime).
+
+### Add via Link
+
+"Add via Link..." downloads whatever URL you paste and checks that its
+content actually looks like a MIDI file (starts with the `MThd` header) or an
+SF2 SoundFont (starts with a `RIFF`/`sfbk` header) before adding it to your
+library -- so a broken link, an HTML error page, or the wrong file type gets
+rejected with a clear message instead of silently corrupting your library.
+The link needs to point directly at the file (a URL that ends up serving the
+raw bytes when fetched), not a webpage that merely links to a download
+button.
+
+### Export to WAV/MP3
+
+Export renders the SoundFont+MIDI pairing you currently have loaded (not
+necessarily whatever's selected in the dropdowns if you've since changed
+selection -- reload the pairing you want first, then export). WAV export
+always works out of the box. MP3 export uses the `lameenc` library, which
+`build_exe.py`'s `pip install -r requirements.txt` step installs like any
+other dependency -- no separate download needed.
+
+## Troubleshooting
+
+**"FluidSynth could not be loaded" error on startup**
+The `.dll` files aren't where the app expects them. Make sure you copied them
+into `bin\` before running `build_exe.py` (they get baked into the exe at
+build time), or, if running from source, into a `bin\` folder next to
+`rsc_midi_player.py`.
+
+**No sound, but no error either**
+Windows sometimes needs the default playback device set correctly. Try
+unplugging/replugging headphones or checking Windows sound settings. You can
+also try changing the audio driver in `rsc_midi_player.py`'s
+`PlaybackEngine.ensure_synth` method from `"dsound"` to `"waveout"` and
+rebuilding.
+
+**"That library file is missing on disk"**
+Someone (or something) deleted a file out of `Soundfonts\`/`Midis\` without
+going through the app's Remove button. Just re-import it.
+
+**Antivirus flags the exe**
+This is a common false positive for PyInstaller-built executables (since
+they're a single unsigned binary that unpacks itself at runtime). It's not
+inherent to this app; you can verify by reading the source in
+`rsc_midi_player.py`. Code-signing the exe would resolve this but requires a
+paid certificate.
+
+## Notes on how it works (for future changes)
+
+- `LibraryManager` (top of `rsc_midi_player.py`) owns `library.json` and the
+  `Soundfonts\`/`Midis\` folders: importing, deduping by SHA-1 content hash,
+  removing, and remembering the last-selected soundfont/MIDI.
+- `mido` parses the MIDI file and resolves tempo-map timing into real seconds
+  for every event.
+- A background thread walks through those timed events and calls into
+  FluidSynth (`note_on`, `note_off`, `control_change`, `program_change`,
+  `pitch_bend`) at the right moments.
+- Seeking works by silencing all channels, "replaying" only the non-audible
+  state changes (patch/program/pan/etc.) up to the target time so the sound
+  is correct when playback resumes, then continuing from there.
+- Export renders offline: it uses a second, throwaway FluidSynth instance
+  (never touching the one used for live playback) and calls
+  `get_samples()` directly instead of playing through an audio device, so
+  it produces the whole file in roughly the time it takes to compute the
+  audio rather than the track's real length. WAV is written with the
+  standard-library `wave` module; MP3 is encoded with `lameenc`.
+- "Add via Link" streams the download to disk in chunks (so it doesn't
+  need to hold a huge SoundFont entirely in memory) and checks the file's
+  magic bytes as soon as enough of it has arrived, before committing to
+  the rest of the download.
