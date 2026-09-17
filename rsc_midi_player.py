@@ -100,6 +100,22 @@ APP_GITHUB_USER = "AshJamB"
 APP_REPO_URL = f"https://github.com/{APP_GITHUB_USER}/RSC-Midi-Player"
 NUM_CHANNELS = 16
 RENDER_SAMPLE_RATE = 44100
+
+# ---------------------------------------------------------------------------
+# Color palette matching the app icon (deep purple + gold), used to reskin
+# every widget away from the stock Windows ("vista" theme) look.
+# ---------------------------------------------------------------------------
+COLOR_BG = "#2b1a4a"          # main background, deep purple
+COLOR_BG_PANEL = "#3a2560"    # slightly lighter panels/fields
+COLOR_BG_ALT = "#241640"      # recessed areas (canvases, troughs)
+COLOR_ACCENT = "#e0ab3c"      # gold -- buttons, highlights
+COLOR_ACCENT_ACTIVE = "#f2c15c"  # gold, hover/active
+COLOR_ACCENT_DARK = "#a97c22" # gold, pressed/border
+COLOR_TEXT = "#f3ead9"        # warm off-white text
+COLOR_TEXT_MUTED = "#c3b3dd"  # muted lavender text (status lines, captions)
+COLOR_BORDER = "#7a5aa8"      # lavender borders
+COLOR_DISABLED_BG = "#4a3a70"
+COLOR_DISABLED_FG = "#8f80ac"
 DOWNLOAD_USER_AGENT = f"Mozilla/5.0 (compatible; RSC-MIDI-Player/{__version__})"
 MIDI_MAGIC = b"MThd"
 
@@ -772,6 +788,7 @@ class ProgressDialog(tk.Toplevel):
     def __init__(self, parent, title, allow_cancel=False, on_cancel=None):
         super().__init__(parent)
         self.title(title)
+        self.configure(bg=COLOR_BG)
         self.resizable(False, False)
         self.transient(parent)
         self.protocol("WM_DELETE_WINDOW", lambda: None)  # no closing via the X
@@ -869,6 +886,8 @@ class PlayerApp:
         help_menu = tk.Menu(menubar, tearoff=0)
         help_menu.add_command(label="About RSC MIDI Player", command=self._open_about_dialog)
         menubar.add_cascade(label="Help", menu=help_menu)
+        style_menu(menubar)
+        style_menu(help_menu)
         self.root.config(menu=menubar)
 
         # -- SoundFont row --
@@ -941,7 +960,7 @@ class PlayerApp:
         self.vol_scale.set(50)
         self.vol_scale.pack(side="left", fill="x", expand=True, padx=8)
 
-        ttk.Label(self.root, textvariable=self.status_var, foreground="#555").pack(
+        ttk.Label(self.root, textvariable=self.status_var, foreground=COLOR_TEXT_MUTED).pack(
             side="bottom", fill="x", padx=10, pady=(0, 8)
         )
 
@@ -1182,6 +1201,7 @@ class PlayerApp:
 
         dialog = tk.Toplevel(self.root)
         dialog.title("Export")
+        dialog.configure(bg=COLOR_BG)
         dialog.resizable(False, False)
         dialog.transient(self.root)
         dialog.grab_set()
@@ -1200,7 +1220,7 @@ class PlayerApp:
         ttk.Radiobutton(frm_fmt, text="MP3", value="mp3", variable=fmt_var,
                          command=lambda: on_fmt_change(), state=mp3_state).pack(anchor="w")
         if lameenc is None:
-            ttk.Label(frm_fmt, text="(MP3 unavailable: lameenc not installed)", foreground="#a00").pack(anchor="w")
+            ttk.Label(frm_fmt, text="(MP3 unavailable: lameenc not installed)", foreground="#ff8080").pack(anchor="w")
 
         frm_bitrate = ttk.Frame(dialog)
         frm_bitrate.pack(anchor="w", **pad)
@@ -1297,6 +1317,7 @@ class PlayerApp:
 
         dialog = tk.Toplevel(self.root)
         dialog.title("Channel Instruments")
+        dialog.configure(bg=COLOR_BG)
         dialog.transient(self.root)
         dialog.grab_set()
         dialog.geometry("620x440")
@@ -1309,7 +1330,7 @@ class PlayerApp:
         container = ttk.Frame(dialog)
         container.pack(fill="both", expand=True, padx=12, pady=6)
 
-        canvas = tk.Canvas(container, borderwidth=0, highlightthickness=0)
+        canvas = tk.Canvas(container, borderwidth=0, highlightthickness=0, bg=COLOR_BG)
         scrollbar = ttk.Scrollbar(container, orient="vertical", command=canvas.yview)
         rows_frame = ttk.Frame(canvas)
         rows_frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
@@ -1346,7 +1367,7 @@ class PlayerApp:
             for child in rows_frame.winfo_children():
                 child.destroy()
 
-            preset_labels = [f"Bank {b} / Preset {p} — {n}" for b, p, n in presets]
+            preset_labels = [f"Bank {b} / Preset {p}: {n}" for b, p, n in presets]
             preset_lookup = {label: (b, p) for label, (b, p, _n) in zip(preset_labels, presets)}
 
             channel_programs = summarize_channel_programs(self.engine.events)
@@ -1457,6 +1478,7 @@ class PlayerApp:
     def _open_about_dialog(self):
         dialog = tk.Toplevel(self.root)
         dialog.title(f"About {APP_TITLE}")
+        dialog.configure(bg=COLOR_BG)
         dialog.resizable(False, False)
         dialog.transient(self.root)
         dialog.grab_set()
@@ -1464,11 +1486,11 @@ class PlayerApp:
         pad = {"padx": 24, "pady": 4}
         ttk.Label(dialog, text=APP_TITLE, font=("", 14, "bold")).pack(padx=24, pady=(20, 2))
         ttk.Label(dialog, text=f"Version {__version__}").pack(**pad)
-        ttk.Label(dialog, text="A portable player for MIDI files through any\nSoundFont — game soundfonts, retro fonts, or anything else.",
+        ttk.Label(dialog, text="A portable player for MIDI files through any\nSoundFont: game soundfonts, retro fonts, or anything else.",
                   justify="center").pack(padx=24, pady=(4, 10))
         ttk.Separator(dialog, orient="horizontal").pack(fill="x", padx=20, pady=4)
         ttk.Label(dialog, text=f"Created by {APP_AUTHOR}").pack(**pad)
-        ttk.Label(dialog, text=f"github.com/{APP_GITHUB_USER}", foreground="#0645AD", cursor="hand2").pack(**pad)
+        ttk.Label(dialog, text=f"github.com/{APP_GITHUB_USER}", foreground=COLOR_ACCENT_ACTIVE, cursor="hand2").pack(**pad)
 
         def open_repo(_event=None):
             webbrowser.open(APP_REPO_URL)
@@ -1477,7 +1499,7 @@ class PlayerApp:
             if isinstance(child, ttk.Label) and child.cget("text") == f"github.com/{APP_GITHUB_USER}":
                 child.bind("<Button-1>", open_repo)
 
-        ttk.Label(dialog, text="Licensed under the MIT License.", foreground="#888").pack(pady=(6, 4))
+        ttk.Label(dialog, text="Licensed under the MIT License.", foreground=COLOR_TEXT_MUTED).pack(pady=(6, 4))
 
         ttk.Button(dialog, text="Close", command=dialog.destroy).pack(pady=(6, 18))
 
@@ -1492,14 +1514,94 @@ def _fmt_time(seconds):
     return f"{seconds // 60:02d}:{seconds % 60:02d}"
 
 
+def get_icon_path():
+    base_dir = sys._MEIPASS if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__))  # type: ignore[attr-defined]
+    path = os.path.join(base_dir, "icon.ico")
+    return path if os.path.isfile(path) else None
+
+
+def apply_theme(root):
+    """Reskin every widget to the app's own purple/gold look instead of the
+    stock OS theme ("vista" on Windows just borrows native, Windows-styled
+    controls). "clam" is a fully tk-drawn ttk theme, so every color below
+    actually takes effect instead of being ignored in favor of native
+    rendering."""
+    root.configure(bg=COLOR_BG)
+
+    style = ttk.Style(root)
+    style.theme_use("clam")
+
+    style.configure(".", background=COLOR_BG, foreground=COLOR_TEXT,
+                     fieldbackground=COLOR_BG_PANEL, bordercolor=COLOR_BORDER,
+                     darkcolor=COLOR_BG_PANEL, lightcolor=COLOR_BG_PANEL,
+                     troughcolor=COLOR_BG_ALT, focuscolor=COLOR_ACCENT)
+
+    style.configure("TFrame", background=COLOR_BG)
+    style.configure("TLabel", background=COLOR_BG, foreground=COLOR_TEXT)
+
+    style.configure("TLabelframe", background=COLOR_BG, bordercolor=COLOR_BORDER, relief="solid")
+    style.configure("TLabelframe.Label", background=COLOR_BG, foreground=COLOR_ACCENT,
+                     font=("", 9, "bold"))
+
+    style.configure("TButton", background=COLOR_ACCENT, foreground=COLOR_BG,
+                     bordercolor=COLOR_ACCENT_DARK, relief="flat", focusthickness=0,
+                     padding=(10, 5))
+    style.map("TButton",
+              background=[("disabled", COLOR_DISABLED_BG), ("pressed", COLOR_ACCENT_DARK),
+                          ("active", COLOR_ACCENT_ACTIVE)],
+              foreground=[("disabled", COLOR_DISABLED_FG)])
+
+    style.configure("TCombobox", fieldbackground=COLOR_BG_PANEL, background=COLOR_ACCENT,
+                     foreground=COLOR_TEXT, arrowcolor=COLOR_BG, bordercolor=COLOR_BORDER,
+                     selectbackground=COLOR_BG_PANEL, selectforeground=COLOR_TEXT)
+    style.map("TCombobox",
+              fieldbackground=[("readonly", COLOR_BG_PANEL), ("disabled", COLOR_DISABLED_BG)],
+              foreground=[("disabled", COLOR_DISABLED_FG)],
+              background=[("disabled", COLOR_DISABLED_BG)])
+    # The Combobox dropdown list is a plain Tk Listbox under the hood, not
+    # themeable via ttk.Style -- set it through the classic option database.
+    root.option_add("*TCombobox*Listbox.background", COLOR_BG_PANEL)
+    root.option_add("*TCombobox*Listbox.foreground", COLOR_TEXT)
+    root.option_add("*TCombobox*Listbox.selectBackground", COLOR_ACCENT)
+    root.option_add("*TCombobox*Listbox.selectForeground", COLOR_BG)
+
+    style.configure("Horizontal.TScale", background=COLOR_BG, troughcolor=COLOR_BG_ALT,
+                     bordercolor=COLOR_BORDER)
+    style.map("Horizontal.TScale", background=[("active", COLOR_ACCENT)])
+
+    style.configure("TSeparator", background=COLOR_BORDER)
+
+    style.configure("Horizontal.TProgressbar", background=COLOR_ACCENT,
+                     troughcolor=COLOR_BG_ALT, bordercolor=COLOR_BORDER, lightcolor=COLOR_ACCENT,
+                     darkcolor=COLOR_ACCENT_DARK)
+
+    style.configure("Vertical.TScrollbar", background=COLOR_ACCENT, troughcolor=COLOR_BG_ALT,
+                     bordercolor=COLOR_BORDER, arrowcolor=COLOR_BG)
+    style.map("Vertical.TScrollbar", background=[("active", COLOR_ACCENT_ACTIVE)])
+
+    style.configure("TRadiobutton", background=COLOR_BG, foreground=COLOR_TEXT)
+    style.map("TRadiobutton", background=[("active", COLOR_BG)])
+
+
+def style_menu(menu):
+    """tk.Menu is a classic Tk widget (not ttk), so it needs its colors set
+    directly rather than through ttk.Style."""
+    menu.configure(
+        bg=COLOR_BG_PANEL, fg=COLOR_TEXT,
+        activebackground=COLOR_ACCENT, activeforeground=COLOR_BG,
+        borderwidth=0,
+    )
+
+
 def main():
     root = tk.Tk()
-    try:
-        style = ttk.Style(root)
-        if sys.platform.startswith("win"):
-            style.theme_use("vista")
-    except Exception:
-        pass
+    apply_theme(root)
+    icon_path = get_icon_path()
+    if icon_path:
+        try:
+            root.iconbitmap(icon_path)
+        except Exception:
+            pass
     app = PlayerApp(root)
     root.mainloop()
 

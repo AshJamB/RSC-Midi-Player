@@ -30,6 +30,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 BIN_DIR = os.path.join(HERE, "bin")
 APP_NAME = "RSC-MIDI-Player"
 ENTRY = os.path.join(HERE, "rsc_midi_player.py")
+ICON_PATH = os.path.join(HERE, "icon.ico")
 
 GITHUB_API_LATEST = "https://api.github.com/repos/FluidSynth/fluidsynth/releases/latest"
 # Which release asset to grab. FluidSynth's Windows x64 build as of the
@@ -116,6 +117,15 @@ def main():
     ]
     for dll in dlls:
         cmd += ["--add-binary", f"{dll}{os.pathsep}."]
+
+    if os.path.isfile(ICON_PATH):
+        cmd += ["--icon", ICON_PATH]
+        # Also bundle icon.ico as a runtime resource (not just the exe's own
+        # file icon) so the running app can find it via get_icon_path() and
+        # set the window/taskbar icon itself, e.g. for dialogs.
+        cmd += ["--add-data", f"{ICON_PATH}{os.pathsep}."]
+    else:
+        print(f"NOTE: {ICON_PATH} not found -- building with PyInstaller's default icon.")
 
     cmd.append(ENTRY)
 

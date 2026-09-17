@@ -15,6 +15,7 @@ Created by Ash Brittain ([AshJamB](https://github.com/AshJamB)).
 - `build_exe.py` - packages the app into a single portable `.exe`
 - `README.md` - this file
 - `LICENSE` - MIT license
+- `icon.ico` - the app's icon, used for the built `.exe` (see **The icon** below)
 - `.github/workflows/release.yml` - builds and publishes a GitHub Release automatically whenever you push to `main` (see **Releasing a new version** below)
 
 ## Important: building the .exe must happen on Windows
@@ -193,6 +194,28 @@ even if you forgot to bump `__version__` yourself.
 You can also trigger a release manually with an exact version from GitHub's
 Actions tab (Release RSC MIDI Player > Run workflow > version field) if you
 ever need to.
+
+## The icon
+
+`build_exe.py` embeds `icon.ico` into the built exe via PyInstaller's
+`--icon` flag, so it shows up in Explorer, the taskbar, and the title bar
+instead of PyInstaller's own generic default icon (every unconfigured
+PyInstaller app gets that same default -- it's not unique to this project).
+To swap it for a different icon, replace `icon.ico` with your own
+multi-resolution `.ico` file (16/32/48/64/128/256px) of the same name and
+rebuild; if `icon.ico` is ever missing, the build still works, it just falls
+back to PyInstaller's default.
+
+## The UI theme
+
+The whole app is reskinned to match the icon's purple/gold palette instead
+of looking like a stock Windows dialog. This needs the `clam` ttk theme
+specifically -- Windows' native "vista" theme renders controls via the OS's
+own theme engine, which looks native but ignores almost all color styling;
+`clam` draws every widget itself, so the colors actually apply. The palette
+lives as a handful of `COLOR_*` constants near the top of
+`rsc_midi_player.py` (`apply_theme()`) -- tweak those to re-theme the whole
+app in one place.
 
 ## Troubleshooting
 
