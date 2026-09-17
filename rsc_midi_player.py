@@ -20,6 +20,8 @@ import ctypes
 import hashlib
 import json
 import os
+import re
+import subprocess
 import sys
 import tempfile
 import threading
@@ -31,6 +33,7 @@ import urllib.request
 import uuid
 import wave
 import webbrowser
+import zipfile
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
 # ---------------------------------------------------------------------------
@@ -119,6 +122,16 @@ COLOR_DISABLED_FG = "#8f80ac"
 DOWNLOAD_USER_AGENT = f"Mozilla/5.0 (compatible; RSC-MIDI-Player/{__version__})"
 MIDI_MAGIC = b"MThd"
 
+# ---------------------------------------------------------------------------
+# Self-update. Uses GitHub's plain REST API with no credentials -- the same
+# call anyone's browser makes -- so it only succeeds while the repo is
+# public. While it's private this just fails quietly (an HTTP 404, as if the
+# repo doesn't exist) and the app carries on as normal; nothing here stores,
+# prompts for, or requires a token. If the repo is ever made public, this
+# starts working with no code changes needed.
+# ---------------------------------------------------------------------------
+GITHUB_RELEASES_LATEST_API = f"https://api.github.com/repos/{APP_GITHUB_USER}/RSC-Midi-Player/releases/latest"
+
 
 def get_app_dir():
     """Directory the app's own folder (Soundfonts/, Midis/, library.json)
@@ -199,6 +212,111 @@ def _validate_magic(header_buf, kind, dest_path):
             pass
         expected = "a MIDI file (should start with 'MThd')" if kind == "midi" else "an SF2 SoundFont (should be a RIFF/sfbk file)"
         raise ValueError(f"That link doesn't look like {expected}.")
+
+
+def _parse_semver(text):
+    """'v1.2.3' or '1.2.3' -> (1, 2, 3); anything else -> None."""
+    if not text:
+        return None
+    m = re.match(r"^[vV]?(\d+)\.(\d+)\.(\d+)$", text.strip())
+    return tuple(int(x) for x in m.groups()) if m else None
+
+
+def fetch_latest_release():
+    """Query GitHub's public Releases API for this repo's latest release.
+    No authentication is sent -- this is exactly the request a browser makes
+    for a public repo. Raises RuntimeError/ValueError on any failure (no
+    internet, rate limiting, or -- while the repo is private -- a 404, since
+    a private repo's releases simply aren't visible without a token this app
+    doesn't store). Callers decide how loudly to surface that."""
+    req = urllib.request.Request(
+        GITHUB_RELEASES_LATEST_API,
+        headers={"User-Agent": DOWNLOAD_USER_AGENT, "Accept": "application/vnd.github+json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            raise RuntimeError(
+                "No release found (this happens while the repo is private -- "
+                "checking for updates needs the repo, or at least its "
+                "releases, to be public)."
+            ) from exc
+        raise RuntimeError(f"GitHub returned HTTP {exc.code}.") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"Could not reach GitHub: {exc.reason}") from exc
+
+    tag = data.get("tag_name", "")
+    version = _parse_semver(tag)
+    if version is None:
+        raise ValueError(f"Latest release tag {tag!r} isn't a plain vX.Y.Z version.")
+
+    asset_url = None
+    asset_name = None
+    for asset in data.get("assets", []):
+        name = asset.get("name", "")
+        if name.lower().endswith(".zip") and "windows" in name.lower():
+            asset_url = asset.get("browser_download_url")
+            asset_name = name
+            break
+    if not asset_url:
+        raise ValueError("Latest release has no Windows .zip asset to download.")
+
+    return {
+        "tag": tag,
+        "version": version,
+        "version_str": "%d.%d.%d" % version,
+        "asset_name": asset_name,
+        "download_url": asset_url,
+        "notes": (data.get("body") or "").strip(),
+    }
+
+
+def start_self_update(zip_bytes):
+    """Extract the new .exe from a downloaded release zip and hand off to a
+    tiny detached helper script that waits for this process to exit, swaps
+    the exe, relaunches it, then deletes itself. Only meaningful for the
+    frozen .exe -- raises if called while running from source, since there's
+    no exe here to replace."""
+    if not getattr(sys, "frozen", False):
+        raise RuntimeError("Self-update only applies to the built .exe, not when running from source.")
+
+    current_exe = os.path.abspath(sys.executable)
+    tmp_dir = tempfile.mkdtemp(prefix="rscmp_update_")
+    zip_path = os.path.join(tmp_dir, "update.zip")
+    with open(zip_path, "wb") as f:
+        f.write(zip_bytes)
+
+    with zipfile.ZipFile(zip_path) as zf:
+        exe_member = next((n for n in zf.namelist() if n.lower().endswith(".exe")), None)
+        if exe_member is None:
+            raise RuntimeError("Downloaded update .zip doesn't contain an .exe.")
+        new_exe_path = os.path.join(tmp_dir, "new.exe")
+        with zf.open(exe_member) as src, open(new_exe_path, "wb") as dst:
+            while True:
+                chunk = src.read(1024 * 1024)
+                if not chunk:
+                    break
+                dst.write(chunk)
+
+    # A short delay gives this process time to fully exit (and release its
+    # lock on current_exe) before the move is attempted.
+    bat_path = os.path.join(tmp_dir, "apply_update.bat")
+    with open(bat_path, "w", encoding="utf-8") as f:
+        f.write(
+            "@echo off\r\n"
+            "timeout /t 2 /nobreak > NUL\r\n"
+            f'move /y "{new_exe_path}" "{current_exe}"\r\n'
+            f'start "" "{current_exe}"\r\n'
+            'del "%~f0"\r\n'
+        )
+
+    subprocess.Popen(
+        ["cmd", "/c", bat_path],
+        creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP,
+        close_fds=True,
+    )
 
 
 def write_wav_file(path, pcm_bytes, sample_rate=RENDER_SAMPLE_RATE, channels=2, sampwidth=2):
@@ -300,6 +418,10 @@ class LibraryManager:
             # specific song+SoundFont pairing, since a fix for one SoundFont
             # is meaningless for another.
             "channel_overrides": {},
+            # Tag of a release the user explicitly dismissed via "Later", so
+            # the startup check doesn't nag about the same version every
+            # launch. A manual "Check for Updates" always checks regardless.
+            "skipped_update_version": None,
         }
         for kind in self.KINDS.values():
             os.makedirs(os.path.join(app_dir, kind["folder"]), exist_ok=True)
@@ -878,12 +1000,19 @@ class PlayerApp:
 
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
+        # Silent startup update check -- only surfaces UI if a genuinely
+        # newer release is found; any failure (offline, private repo, rate
+        # limited) is swallowed quietly here (see _check_for_updates).
+        self.root.after(2000, lambda: self._check_for_updates(manual=False))
+
     def _build_ui(self):
         pad = {"padx": 10, "pady": 6}
 
         # -- Menu bar --
         menubar = tk.Menu(self.root)
         help_menu = tk.Menu(menubar, tearoff=0)
+        help_menu.add_command(label="Check for Updates...", command=lambda: self._check_for_updates(manual=True))
+        help_menu.add_separator()
         help_menu.add_command(label="About RSC MIDI Player", command=self._open_about_dialog)
         menubar.add_cascade(label="Help", menu=help_menu)
         style_menu(menubar)
@@ -1471,6 +1600,99 @@ class PlayerApp:
         self.status_var.set("Finished.")
 
     def _on_close(self):
+        self.engine.shutdown()
+        self.root.destroy()
+
+    # -- self-update -----------------------------------------
+    def _check_for_updates(self, manual=False):
+        """Ask GitHub whether a newer release exists. manual=False (the
+        startup check) is silent about every kind of failure -- offline, the
+        repo still being private, whatever -- and only ever shows anything
+        when a genuinely newer version is found and the user hasn't already
+        dismissed that exact version. manual=True (the Help menu item)
+        always reports a result, including errors, since the user asked."""
+        def worker():
+            try:
+                info = fetch_latest_release()
+            except Exception as exc:
+                if manual:
+                    self.root.after(0, lambda: messagebox.showinfo(
+                        APP_TITLE, f"Couldn't check for updates:\n\n{exc}"))
+                return
+
+            current = _parse_semver(__version__) or (0, 0, 0)
+            if info["version"] <= current:
+                if manual:
+                    self.root.after(0, lambda: messagebox.showinfo(
+                        APP_TITLE, f"You're up to date (v{__version__})."))
+                return
+
+            if not manual and info["tag"] == self.library.data.get("skipped_update_version"):
+                return
+
+            self.root.after(0, self._prompt_update, info)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _prompt_update(self, info):
+        msg = f"A new version is available: {info['tag']} (you have v{__version__})."
+        if info["notes"]:
+            msg += "\n\nWhat's new:\n" + info["notes"][:600]
+        msg += "\n\nUpdate now? The app will close and reopen on the new version."
+
+        if not messagebox.askyesno(APP_TITLE, msg):
+            self.library.data["skipped_update_version"] = info["tag"]
+            self.library.save()
+            return
+
+        if not getattr(sys, "frozen", False):
+            messagebox.showinfo(
+                APP_TITLE,
+                "You're running from source, not the built .exe, so there's "
+                "nothing here for the app to replace itself with.\n\n"
+                f"Grab the new version manually from:\n{APP_REPO_URL}/releases",
+            )
+            return
+
+        self._download_and_apply_update(info)
+
+    def _download_and_apply_update(self, info):
+        progress = DownloadProgressDialog(self.root, f"Downloading {info['tag']}...")
+
+        def on_progress(downloaded, total):
+            self.root.after(0, progress.update_progress, downloaded, total)
+
+        def worker():
+            try:
+                req = urllib.request.Request(
+                    info["download_url"], headers={"User-Agent": DOWNLOAD_USER_AGENT}
+                )
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    total = resp.headers.get("Content-Length")
+                    total = int(total) if total and total.isdigit() else None
+                    chunks = []
+                    downloaded = 0
+                    while True:
+                        chunk = resp.read(256 * 1024)
+                        if not chunk:
+                            break
+                        chunks.append(chunk)
+                        downloaded += len(chunk)
+                        on_progress(downloaded, total)
+                    data = b"".join(chunks)
+
+                self.root.after(0, progress.set_status, "Applying update...")
+                start_self_update(data)
+            except Exception as exc:
+                self.root.after(0, progress.close)
+                self.root.after(0, lambda: messagebox.showerror(APP_TITLE, f"Update failed:\n{exc}"))
+                return
+
+            self.root.after(0, self._quit_for_update)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _quit_for_update(self):
         self.engine.shutdown()
         self.root.destroy()
 

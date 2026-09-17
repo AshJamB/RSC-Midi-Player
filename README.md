@@ -165,6 +165,33 @@ another's. "Reset All to MIDI Defaults" clears every override for the
 current pairing. Overrides also apply to Export, so what you hear is what
 gets rendered to WAV/MP3.
 
+## Checking for updates
+
+The app can check GitHub for a newer release and update itself in place --
+**Help > Check for Updates...** checks on demand, and it also checks quietly
+in the background a couple seconds after launch (only ever popping something
+up if a genuinely newer version is found, never for a failed check).
+
+If it finds one, it asks before doing anything: choosing "Yes" downloads the
+new release's zip, extracts the exe, and hands off to a tiny helper script
+that waits for the app to close, swaps the old exe for the new one, and
+reopens it -- so it comes back up already on the new version. Choosing "No"
+just dismisses that version; it won't ask about that exact release again on
+future launches (Help > Check for Updates... always re-checks regardless).
+
+This only works while the repo is **public** -- checking for releases uses
+GitHub's plain, unauthenticated API (the same request your browser makes
+for a public repo's releases page), and this app deliberately doesn't store
+any GitHub token to read a private repo's releases. While the repo stays
+private, the startup check just fails quietly in the background and the app
+carries on as normal; the manual "Check for Updates..." menu item will say
+it couldn't find a release. If you make the repo public later, this starts
+working immediately with no code or settings changes needed.
+
+Running `python rsc_midi_player.py` from source (not the built `.exe`) can
+still *check* for updates, but there's no exe for it to replace -- accepting
+the prompt just points you to the Releases page instead.
+
 ## Releasing a new version
 
 Releases are fully automatic -- there's no tagging step to remember. Just
@@ -273,3 +300,12 @@ paid certificate.
   means "ignore this channel's own program-change/bank-select messages for
   the rest of the song and stay pinned to this instrument," applied on top
   of whatever the MIDI file says, for both live playback and export.
+- Self-update hits GitHub's public `/releases/latest` REST endpoint with no
+  auth header at all, so it only succeeds while the repo is public (a
+  private repo just 404s, which the app treats as "no update available"
+  rather than an error worth bothering you with on every launch). Applying
+  an update downloads the release zip, pulls the `.exe` out of it, then
+  writes and launches a small detached `.bat` file that sleeps briefly,
+  moves the new exe over the running one, relaunches it, and deletes
+  itself -- necessary because a running Windows exe can't overwrite its own
+  file directly.
