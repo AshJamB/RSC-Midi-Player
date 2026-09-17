@@ -103,10 +103,10 @@ library (this also deletes its copied file from `Soundfonts\`/`Midis\`).
 1. Open `RSC-MIDI-Player.exe`.
 2. Click **Import...** next to SoundFont and pick a `.sf2`/`.sf3` file (do
    this once per soundfont -- next time it'll just be in the dropdown), or
-   click **Add via Link...** and paste a direct download URL to have the app
+   click **Add via URL...** and paste a direct download URL to have the app
    fetch it for you.
 3. Do the same for MIDI: **Import...** for a local `.mid` file, or
-   **Add via Link...** to download one from a URL.
+   **Add via URL...** to download one from a URL.
 4. Pick from the dropdowns any time to switch between soundfonts/MIDIs
    you've already imported.
 5. Click **Play**. Use the seek bar to jump around, and the volume slider to
@@ -118,9 +118,9 @@ library (this also deletes its copied file from `Soundfonts\`/`Midis\`).
    file out loud while exporting, and normally finishes well before the
    track's actual runtime).
 
-### Add via Link
+### Add via URL
 
-"Add via Link..." downloads whatever URL you paste and checks that its
+"Add via URL..." downloads whatever URL you paste and checks that its
 content actually looks like a MIDI file (starts with the `MThd` header) or an
 SF2 SoundFont (starts with a `RIFF`/`sfbk` header) before adding it to your
 library -- so a broken link, an HTML error page, or the wrong file type gets
@@ -183,7 +183,7 @@ paid certificate.
   it produces the whole file in roughly the time it takes to compute the
   audio rather than the track's real length. WAV is written with the
   standard-library `wave` module; MP3 is encoded with `lameenc`.
-- "Add via Link" streams the download to disk in chunks (so it doesn't
+- "Add via URL" streams the download to disk in chunks (so it doesn't
   need to hold a huge SoundFont entirely in memory) and checks the file's
   magic bytes as soon as enough of it has arrived, before committing to
   the rest of the download.

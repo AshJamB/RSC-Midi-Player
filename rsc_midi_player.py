@@ -732,7 +732,7 @@ class PlayerApp:
         ttk.Button(frm_sf, text="Import...", command=self._import_soundfont).grid(
             row=0, column=1, padx=4
         )
-        ttk.Button(frm_sf, text="Add via Link...", command=lambda: self._import_via_link("soundfont")).grid(
+        ttk.Button(frm_sf, text="Add via URL...", command=lambda: self._import_via_link("soundfont")).grid(
             row=0, column=2, padx=4
         )
         ttk.Button(frm_sf, text="Remove", command=self._remove_soundfont).grid(
@@ -748,7 +748,7 @@ class PlayerApp:
         ttk.Button(frm_midi, text="Import...", command=self._import_midi).grid(
             row=0, column=1, padx=4
         )
-        ttk.Button(frm_midi, text="Add via Link...", command=lambda: self._import_via_link("midi")).grid(
+        ttk.Button(frm_midi, text="Add via URL...", command=lambda: self._import_via_link("midi")).grid(
             row=0, column=2, padx=4
         )
         ttk.Button(frm_midi, text="Remove", command=self._remove_midi).grid(
