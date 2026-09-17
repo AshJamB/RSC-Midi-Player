@@ -105,20 +105,24 @@ NUM_CHANNELS = 16
 RENDER_SAMPLE_RATE = 44100
 
 # ---------------------------------------------------------------------------
-# Color palette matching the app icon (deep purple + gold), used to reskin
-# every widget away from the stock Windows ("vista" theme) look.
+# Color palette -- a light, modern take on stock Windows/Fluent colors
+# (rather than native "vista" chrome, which ignores most styling anyway).
+# White/light-gray surfaces, Windows' own accent blue for the primary
+# action and highlights, dark neutral text.
 # ---------------------------------------------------------------------------
-COLOR_BG = "#2b1a4a"          # main background, deep purple
-COLOR_BG_PANEL = "#3a2560"    # slightly lighter panels/fields
-COLOR_BG_ALT = "#241640"      # recessed areas (canvases, troughs)
-COLOR_ACCENT = "#e0ab3c"      # gold -- buttons, highlights
-COLOR_ACCENT_ACTIVE = "#f2c15c"  # gold, hover/active
-COLOR_ACCENT_DARK = "#a97c22" # gold, pressed/border
-COLOR_TEXT = "#f3ead9"        # warm off-white text
-COLOR_TEXT_MUTED = "#c3b3dd"  # muted lavender text (status lines, captions)
-COLOR_BORDER = "#7a5aa8"      # lavender borders
-COLOR_DISABLED_BG = "#4a3a70"
-COLOR_DISABLED_FG = "#8f80ac"
+COLOR_BG = "#f3f3f3"          # main window background (Win11 app chrome gray)
+COLOR_BG_PANEL = "#ffffff"    # cards/fields/panels
+COLOR_BG_ALT = "#e5e5e5"      # recessed areas (troughs, canvases)
+COLOR_ACCENT = "#0078d4"      # Windows accent blue -- primary button, highlights
+COLOR_ACCENT_ACTIVE = "#1a86d9"  # accent, hover
+COLOR_ACCENT_DARK = "#005a9e"    # accent, pressed
+COLOR_TEXT = "#1a1a1a"        # near-black text
+COLOR_TEXT_MUTED = "#605e5c"  # muted gray text (status lines, captions)
+COLOR_BORDER = "#d1d1d1"      # light neutral borders
+COLOR_DISABLED_BG = "#e8e8e8"
+COLOR_DISABLED_FG = "#a6a4a2"
+UI_FONT = ("Segoe UI", 9)
+UI_FONT_BOLD = ("Segoe UI", 9, "bold")
 DOWNLOAD_USER_AGENT = f"Mozilla/5.0 (compatible; RSC-MIDI-Player/{__version__})"
 MIDI_MAGIC = b"MThd"
 
@@ -131,6 +135,14 @@ MIDI_MAGIC = b"MThd"
 # starts working with no code changes needed.
 # ---------------------------------------------------------------------------
 GITHUB_RELEASES_LATEST_API = f"https://api.github.com/repos/{APP_GITHUB_USER}/RSC-Midi-Player/releases/latest"
+
+# Matches the folder-name convention used by the release zip itself, e.g.
+# "RSC-Midi-Player-1.0.2-windows" -- if (and only if) the app's own folder
+# still looks like this, self-update renames it to match the new version too,
+# so the folder name never lags behind what's actually installed. A folder
+# the user renamed to something else (it won't match this pattern) is left
+# alone -- we never touch a folder name we don't recognize.
+UPDATE_FOLDER_NAME_RE = re.compile(r"^(RSC-Midi-Player-)(\d+\.\d+\.\d+)(-windows)$", re.IGNORECASE)
 
 
 def get_app_dir():
@@ -273,16 +285,47 @@ def fetch_latest_release():
     }
 
 
-def start_self_update(zip_bytes):
+def plan_update_folder_rename(exe_dir, new_version_str):
+    """If exe_dir's own name still looks like the release folder convention
+    ("RSC-Midi-Player-<old version>-windows"), return the sibling path it
+    should be renamed to so the folder name matches the version being
+    installed. Returns None if the name doesn't match that convention (e.g.
+    the user renamed the folder to something of their own), if it already
+    matches the new version, or if a folder with the new name already
+    exists (never clobber something that's already there)."""
+    parent_dir = os.path.dirname(exe_dir.rstrip("\\/"))
+    folder_name = os.path.basename(exe_dir.rstrip("\\/"))
+    m = UPDATE_FOLDER_NAME_RE.match(folder_name)
+    if not m or m.group(2) == new_version_str:
+        return None
+    new_folder_name = f"{m.group(1)}{new_version_str}{m.group(3)}"
+    new_dir = os.path.join(parent_dir, new_folder_name)
+    if os.path.normcase(new_dir) == os.path.normcase(exe_dir):
+        return None
+    if os.path.exists(new_dir):
+        return None
+    return new_dir
+
+
+def start_self_update(zip_bytes, new_version_str=None):
     """Extract the new .exe from a downloaded release zip and hand off to a
     tiny detached helper script that waits for this process to exit, swaps
     the exe, relaunches it, then deletes itself. Only meaningful for the
     frozen .exe -- raises if called while running from source, since there's
-    no exe here to replace."""
+    no exe here to replace.
+
+    If new_version_str is given and the app's own folder still follows the
+    release-zip naming convention (RSC-Midi-Player-X.Y.Z-windows), the
+    helper script also renames that folder to match the new version, so the
+    folder name never ends up stuck on an old version number. A folder
+    that's been renamed to anything else is left untouched."""
     if not getattr(sys, "frozen", False):
         raise RuntimeError("Self-update only applies to the built .exe, not when running from source.")
 
     current_exe = os.path.abspath(sys.executable)
+    exe_dir = os.path.dirname(current_exe)
+    exe_name = os.path.basename(current_exe)
+
     tmp_dir = tempfile.mkdtemp(prefix="rscmp_update_")
     zip_path = os.path.join(tmp_dir, "update.zip")
     with open(zip_path, "wb") as f:
@@ -300,15 +343,28 @@ def start_self_update(zip_bytes):
                     break
                 dst.write(chunk)
 
+    final_exe = current_exe
+    rename_line = ""
+    if new_version_str:
+        new_dir = plan_update_folder_rename(exe_dir, new_version_str)
+        if new_dir:
+            rename_line = f'if not exist "{new_dir}" move /y "{exe_dir}" "{new_dir}"\r\n'
+            final_exe = os.path.join(new_dir, exe_name)
+
     # A short delay gives this process time to fully exit (and release its
-    # lock on current_exe) before the move is attempted.
+    # lock on current_exe) before the move is attempted. The exe is swapped
+    # in place first (while the folder still has its old name/path), then
+    # the whole folder is renamed (carrying the already-updated exe, plus
+    # library.json/Soundfonts/Midis, with it), then the app is relaunched
+    # from wherever it ended up.
     bat_path = os.path.join(tmp_dir, "apply_update.bat")
     with open(bat_path, "w", encoding="utf-8") as f:
         f.write(
             "@echo off\r\n"
             "timeout /t 2 /nobreak > NUL\r\n"
             f'move /y "{new_exe_path}" "{current_exe}"\r\n'
-            f'start "" "{current_exe}"\r\n'
+            f"{rename_line}"
+            f'start "" "{final_exe}"\r\n'
             'del "%~f0"\r\n'
         )
 
@@ -963,7 +1019,7 @@ class PlayerApp:
     def __init__(self, root):
         self.root = root
         self.root.title(f"{APP_TITLE} v{__version__}")
-        self.root.geometry("600x360")
+        self.root.geometry("640x430")
         self.root.resizable(False, False)
 
         self.app_dir = get_app_dir()
@@ -1006,7 +1062,7 @@ class PlayerApp:
         self.root.after(2000, lambda: self._check_for_updates(manual=False))
 
     def _build_ui(self):
-        pad = {"padx": 10, "pady": 6}
+        pad = {"padx": 16, "pady": 8}
 
         # -- Menu bar --
         menubar = tk.Menu(self.root)
@@ -1023,37 +1079,37 @@ class PlayerApp:
         frm_sf = ttk.LabelFrame(self.root, text="SoundFont")
         frm_sf.pack(fill="x", **pad)
         self.sf_combo = ttk.Combobox(frm_sf, state="readonly", width=28)
-        self.sf_combo.grid(row=0, column=0, padx=(8, 4), pady=8, sticky="w")
+        self.sf_combo.grid(row=0, column=0, padx=(10, 6), pady=10, sticky="w")
         self.sf_combo.bind("<<ComboboxSelected>>", self._on_soundfont_selected)
         ttk.Button(frm_sf, text="Import...", command=self._import_soundfont).grid(
-            row=0, column=1, padx=4
+            row=0, column=1, padx=3
         )
         ttk.Button(frm_sf, text="Add via URL...", command=lambda: self._import_via_link("soundfont")).grid(
-            row=0, column=2, padx=4
+            row=0, column=2, padx=3
         )
         ttk.Button(frm_sf, text="Remove", command=self._remove_soundfont).grid(
-            row=0, column=3, padx=(4, 8)
+            row=0, column=3, padx=(3, 10)
         )
 
         # -- MIDI row --
         frm_midi = ttk.LabelFrame(self.root, text="MIDI")
         frm_midi.pack(fill="x", **pad)
         self.midi_combo = ttk.Combobox(frm_midi, state="readonly", width=28)
-        self.midi_combo.grid(row=0, column=0, padx=(8, 4), pady=8, sticky="w")
+        self.midi_combo.grid(row=0, column=0, padx=(10, 6), pady=10, sticky="w")
         self.midi_combo.bind("<<ComboboxSelected>>", self._on_midi_selected)
         ttk.Button(frm_midi, text="Import...", command=self._import_midi).grid(
-            row=0, column=1, padx=4
+            row=0, column=1, padx=3
         )
         ttk.Button(frm_midi, text="Add via URL...", command=lambda: self._import_via_link("midi")).grid(
-            row=0, column=2, padx=4
+            row=0, column=2, padx=3
         )
         ttk.Button(frm_midi, text="Remove", command=self._remove_midi).grid(
-            row=0, column=3, padx=(4, 8)
+            row=0, column=3, padx=(3, 10)
         )
 
         # -- Seek --
         frm_seek = ttk.Frame(self.root)
-        frm_seek.pack(fill="x", **pad)
+        frm_seek.pack(fill="x", padx=16, pady=(14, 0))
         self.seek_scale = ttk.Scale(
             frm_seek, from_=0, to=1000, orient="horizontal",
             command=self._on_seek_drag,
@@ -1062,35 +1118,42 @@ class PlayerApp:
         self.seek_scale.bind("<ButtonPress-1>", lambda e: setattr(self, "_seeking", True))
         self.seek_scale.bind("<ButtonRelease-1>", self._on_seek_release)
 
-        ttk.Label(self.root, textvariable=self.time_var).pack()
+        ttk.Label(self.root, textvariable=self.time_var, foreground=COLOR_TEXT_MUTED).pack(pady=(4, 0))
 
-        # -- Transport --
+        # -- Transport -- Play is the one accented (primary) action; the
+        # Channels button is a small square icon+label control set apart
+        # from the plain text buttons.
         frm_controls = ttk.Frame(self.root)
-        frm_controls.pack(**pad)
-        self.play_btn = ttk.Button(frm_controls, text="Play", command=self._toggle_play, width=10)
-        self.play_btn.grid(row=0, column=0, padx=4)
+        frm_controls.pack(pady=(14, 6))
+        self.play_btn = ttk.Button(
+            frm_controls, text="Play", command=self._toggle_play, width=10, style="Accent.TButton"
+        )
+        self.play_btn.grid(row=0, column=0, padx=6, sticky="s")
         ttk.Button(frm_controls, text="Stop", command=self._stop, width=10).grid(
-            row=0, column=1, padx=4
+            row=0, column=1, padx=6, sticky="s"
         )
         ttk.Button(frm_controls, text="Export...", command=self._open_export_dialog, width=10).grid(
-            row=0, column=2, padx=4
+            row=0, column=2, padx=6, sticky="s"
         )
-        ttk.Button(frm_controls, text="Channels...", command=self._open_channel_mixer, width=10).grid(
-            row=0, column=3, padx=4
-        )
+        self._channels_icon = make_piano_icon()
+        ttk.Button(
+            frm_controls, text="Channels", image=self._channels_icon, compound="top",
+            command=self._open_channel_mixer, style="Square.TButton",
+        ).grid(row=0, column=3, padx=(14, 0), sticky="s")
 
         # -- Volume --
         frm_vol = ttk.Frame(self.root)
-        frm_vol.pack(fill="x", **pad)
-        ttk.Label(frm_vol, text="Volume").pack(side="left")
+        frm_vol.pack(fill="x", padx=16, pady=(10, 6))
+        ttk.Label(frm_vol, text="Volume", foreground=COLOR_TEXT_MUTED).pack(side="left")
         self.vol_scale = ttk.Scale(
             frm_vol, from_=0, to=100, orient="horizontal", command=self._on_volume
         )
         self.vol_scale.set(50)
-        self.vol_scale.pack(side="left", fill="x", expand=True, padx=8)
+        self.vol_scale.pack(side="left", fill="x", expand=True, padx=(10, 0))
 
+        ttk.Separator(self.root, orient="horizontal").pack(side="bottom", fill="x")
         ttk.Label(self.root, textvariable=self.status_var, foreground=COLOR_TEXT_MUTED).pack(
-            side="bottom", fill="x", padx=10, pady=(0, 8)
+            side="bottom", fill="x", padx=16, pady=8
         )
 
     # -- library-backed dropdowns -----------------------------------------
@@ -1682,7 +1745,7 @@ class PlayerApp:
                     data = b"".join(chunks)
 
                 self.root.after(0, progress.set_status, "Applying update...")
-                start_self_update(data)
+                start_self_update(data, info["version_str"])
             except Exception as exc:
                 self.root.after(0, progress.close)
                 self.root.after(0, lambda: messagebox.showerror(APP_TITLE, f"Update failed:\n{exc}"))
@@ -1743,11 +1806,11 @@ def get_icon_path():
 
 
 def apply_theme(root):
-    """Reskin every widget to the app's own purple/gold look instead of the
-    stock OS theme ("vista" on Windows just borrows native, Windows-styled
-    controls). "clam" is a fully tk-drawn ttk theme, so every color below
-    actually takes effect instead of being ignored in favor of native
-    rendering."""
+    """Reskin every widget with a light, modern take on stock Windows
+    colors -- white/light-gray surfaces, Windows' own accent blue, dark
+    neutral text -- instead of native "vista" chrome (which ignores almost
+    all color styling) or the app's old heavy purple/gold look. "clam" is a
+    fully tk-drawn ttk theme, so every color below actually takes effect."""
     root.configure(bg=COLOR_BG)
 
     style = ttk.Style(root)
@@ -1756,52 +1819,70 @@ def apply_theme(root):
     style.configure(".", background=COLOR_BG, foreground=COLOR_TEXT,
                      fieldbackground=COLOR_BG_PANEL, bordercolor=COLOR_BORDER,
                      darkcolor=COLOR_BG_PANEL, lightcolor=COLOR_BG_PANEL,
-                     troughcolor=COLOR_BG_ALT, focuscolor=COLOR_ACCENT)
+                     troughcolor=COLOR_BG_ALT, focuscolor=COLOR_ACCENT,
+                     font=UI_FONT)
 
     style.configure("TFrame", background=COLOR_BG)
-    style.configure("TLabel", background=COLOR_BG, foreground=COLOR_TEXT)
+    style.configure("TLabel", background=COLOR_BG, foreground=COLOR_TEXT, font=UI_FONT)
 
     style.configure("TLabelframe", background=COLOR_BG, bordercolor=COLOR_BORDER, relief="solid")
-    style.configure("TLabelframe.Label", background=COLOR_BG, foreground=COLOR_ACCENT,
-                     font=("", 9, "bold"))
+    style.configure("TLabelframe.Label", background=COLOR_BG, foreground=COLOR_TEXT_MUTED,
+                     font=UI_FONT_BOLD)
 
-    style.configure("TButton", background=COLOR_ACCENT, foreground=COLOR_BG,
-                     bordercolor=COLOR_ACCENT_DARK, relief="flat", focusthickness=0,
-                     padding=(10, 5))
+    # Secondary (default) buttons: light, bordered, native-ish.
+    style.configure("TButton", background=COLOR_BG_PANEL, foreground=COLOR_TEXT,
+                     bordercolor=COLOR_BORDER, relief="solid", borderwidth=1,
+                     focusthickness=0, padding=(12, 6), font=UI_FONT)
     style.map("TButton",
+              background=[("disabled", COLOR_DISABLED_BG), ("pressed", COLOR_BG_ALT),
+                          ("active", COLOR_BG_ALT)],
+              foreground=[("disabled", COLOR_DISABLED_FG)],
+              bordercolor=[("active", COLOR_ACCENT)])
+
+    # Primary (accent-filled) button, used for the main Play/Pause action.
+    style.configure("Accent.TButton", background=COLOR_ACCENT, foreground="#ffffff",
+                     bordercolor=COLOR_ACCENT, relief="flat", focusthickness=0,
+                     padding=(14, 6), font=UI_FONT_BOLD)
+    style.map("Accent.TButton",
               background=[("disabled", COLOR_DISABLED_BG), ("pressed", COLOR_ACCENT_DARK),
                           ("active", COLOR_ACCENT_ACTIVE)],
+              bordercolor=[("disabled", COLOR_DISABLED_BG)],
               foreground=[("disabled", COLOR_DISABLED_FG)])
 
-    style.configure("TCombobox", fieldbackground=COLOR_BG_PANEL, background=COLOR_ACCENT,
-                     foreground=COLOR_TEXT, arrowcolor=COLOR_BG, bordercolor=COLOR_BORDER,
+    # Square icon+label button (Channels...), same look as a normal button,
+    # just squarer padding so the icon-on-top layout reads as one unit.
+    style.configure("Square.TButton", padding=(10, 6), anchor="center")
+
+    style.configure("TCombobox", fieldbackground=COLOR_BG_PANEL, background=COLOR_BG_PANEL,
+                     foreground=COLOR_TEXT, arrowcolor=COLOR_TEXT_MUTED, bordercolor=COLOR_BORDER,
                      selectbackground=COLOR_BG_PANEL, selectforeground=COLOR_TEXT)
     style.map("TCombobox",
               fieldbackground=[("readonly", COLOR_BG_PANEL), ("disabled", COLOR_DISABLED_BG)],
               foreground=[("disabled", COLOR_DISABLED_FG)],
-              background=[("disabled", COLOR_DISABLED_BG)])
+              background=[("disabled", COLOR_DISABLED_BG)],
+              bordercolor=[("focus", COLOR_ACCENT)])
     # The Combobox dropdown list is a plain Tk Listbox under the hood, not
     # themeable via ttk.Style -- set it through the classic option database.
     root.option_add("*TCombobox*Listbox.background", COLOR_BG_PANEL)
     root.option_add("*TCombobox*Listbox.foreground", COLOR_TEXT)
     root.option_add("*TCombobox*Listbox.selectBackground", COLOR_ACCENT)
-    root.option_add("*TCombobox*Listbox.selectForeground", COLOR_BG)
+    root.option_add("*TCombobox*Listbox.selectForeground", "#ffffff")
 
     style.configure("Horizontal.TScale", background=COLOR_BG, troughcolor=COLOR_BG_ALT,
-                     bordercolor=COLOR_BORDER)
-    style.map("Horizontal.TScale", background=[("active", COLOR_ACCENT)])
+                     bordercolor=COLOR_BG_ALT, sliderlength=14, sliderthickness=14)
+    style.map("Horizontal.TScale", background=[("active", COLOR_BG)])
 
     style.configure("TSeparator", background=COLOR_BORDER)
 
     style.configure("Horizontal.TProgressbar", background=COLOR_ACCENT,
-                     troughcolor=COLOR_BG_ALT, bordercolor=COLOR_BORDER, lightcolor=COLOR_ACCENT,
-                     darkcolor=COLOR_ACCENT_DARK)
+                     troughcolor=COLOR_BG_ALT, bordercolor=COLOR_BG_ALT, lightcolor=COLOR_ACCENT,
+                     darkcolor=COLOR_ACCENT, thickness=8)
 
-    style.configure("Vertical.TScrollbar", background=COLOR_ACCENT, troughcolor=COLOR_BG_ALT,
-                     bordercolor=COLOR_BORDER, arrowcolor=COLOR_BG)
-    style.map("Vertical.TScrollbar", background=[("active", COLOR_ACCENT_ACTIVE)])
+    style.configure("Vertical.TScrollbar", background=COLOR_BG_ALT, troughcolor=COLOR_BG,
+                     bordercolor=COLOR_BG, arrowcolor=COLOR_TEXT_MUTED)
+    style.map("Vertical.TScrollbar", background=[("active", COLOR_ACCENT)])
 
-    style.configure("TRadiobutton", background=COLOR_BG, foreground=COLOR_TEXT)
+    style.configure("TRadiobutton", background=COLOR_BG, foreground=COLOR_TEXT, font=UI_FONT)
     style.map("TRadiobutton", background=[("active", COLOR_BG)])
 
 
@@ -1810,9 +1891,35 @@ def style_menu(menu):
     directly rather than through ttk.Style."""
     menu.configure(
         bg=COLOR_BG_PANEL, fg=COLOR_TEXT,
-        activebackground=COLOR_ACCENT, activeforeground=COLOR_BG,
-        borderwidth=0,
+        activebackground=COLOR_ACCENT, activeforeground="#ffffff",
+        borderwidth=0, font=UI_FONT,
     )
+
+
+def make_piano_icon(size=28):
+    """Draw a tiny piano-keys icon at runtime (no bundled image asset needed
+    -- just a handful of PhotoImage.put() pixel-rect fills), used on the
+    square Channels button."""
+    img = tk.PhotoImage(width=size, height=size)
+    img.put(COLOR_BG_PANEL, to=(0, 0, size, size))
+
+    border = COLOR_TEXT_MUTED
+    img.put(border, to=(0, 0, size, 2))
+    img.put(border, to=(0, size - 2, size, size))
+    img.put(border, to=(0, 0, 2, size))
+    img.put(border, to=(size - 2, 0, size, size))
+
+    # A row of thin "key" dividers across the middle -- reads as piano keys
+    # at small sizes without needing real key-shaped geometry.
+    key_color = COLOR_TEXT
+    margin = 5
+    n_dividers = 4
+    usable = size - margin * 2
+    for i in range(1, n_dividers + 1):
+        x = margin + round(i * usable / (n_dividers + 1))
+        img.put(key_color, to=(x, margin, x + 1, size - margin))
+
+    return img
 
 
 def main():

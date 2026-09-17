@@ -188,6 +188,12 @@ carries on as normal; the manual "Check for Updates..." menu item will say
 it couldn't find a release. If you make the repo public later, this starts
 working immediately with no code or settings changes needed.
 
+If your app's own folder is still named the way the release zip names it
+(e.g. `RSC-Midi-Player-1.0.2-windows`), applying an update also renames that
+folder to match the new version, so the folder name never lags behind
+what's actually installed. If you renamed the folder to something of your
+own, it's left alone -- this only touches a folder name it recognizes.
+
 Running `python rsc_midi_player.py` from source (not the built `.exe`) can
 still *check* for updates, but there's no exe for it to replace -- accepting
 the prompt just points you to the Releases page instead.
@@ -235,14 +241,18 @@ back to PyInstaller's default.
 
 ## The UI theme
 
-The whole app is reskinned to match the icon's purple/gold palette instead
-of looking like a stock Windows dialog. This needs the `clam` ttk theme
-specifically -- Windows' native "vista" theme renders controls via the OS's
-own theme engine, which looks native but ignores almost all color styling;
-`clam` draws every widget itself, so the colors actually apply. The palette
-lives as a handful of `COLOR_*` constants near the top of
-`rsc_midi_player.py` (`apply_theme()`) -- tweak those to re-theme the whole
-app in one place.
+The app uses a light, modern take on stock Windows colors -- white/light-gray
+surfaces, Windows' own accent blue for the primary Play button and
+highlights, dark neutral text -- rather than looking like a stock Windows
+dialog (native "vista" chrome) or the app's earlier heavy purple/gold look.
+This needs the `clam` ttk theme specifically -- Windows' native "vista"
+theme renders controls via the OS's own theme engine, which looks native
+but ignores almost all color styling; `clam` draws every widget itself, so
+the colors actually apply. The palette lives as a handful of `COLOR_*`
+constants near the top of `rsc_midi_player.py` (`apply_theme()`) -- tweak
+those to re-theme the whole app in one place. The Channels button's small
+piano-keys icon is drawn at runtime with a few `PhotoImage` pixel fills
+(`make_piano_icon()`) rather than a bundled image file.
 
 ## Troubleshooting
 
@@ -306,6 +316,12 @@ paid certificate.
   rather than an error worth bothering you with on every launch). Applying
   an update downloads the release zip, pulls the `.exe` out of it, then
   writes and launches a small detached `.bat` file that sleeps briefly,
-  moves the new exe over the running one, relaunches it, and deletes
-  itself -- necessary because a running Windows exe can't overwrite its own
-  file directly.
+  moves the new exe over the running one, and relaunches it -- necessary
+  because a running Windows exe can't overwrite its own file directly.
+  Before relaunching, `plan_update_folder_rename()` checks whether the
+  app's own folder still matches the release zip's naming convention
+  (`RSC-Midi-Player-X.Y.Z-windows`); if so, the same helper script renames
+  that folder to the new version too (carrying `library.json`,
+  `Soundfonts\`, `Midis\`, etc. with it) before launching the relaunched
+  exe from its new home. A folder that doesn't match -- because it's been
+  renamed to something else -- is left untouched.
