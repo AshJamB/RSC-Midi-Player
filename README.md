@@ -15,7 +15,7 @@ Created by Ash Brittain ([AshJamB](https://github.com/AshJamB)).
 - `build_exe.py` - packages the app into a single portable `.exe`
 - `README.md` - this file
 - `LICENSE` - MIT license
-- `.github/workflows/release.yml` - builds and publishes a GitHub Release automatically when you push a version tag (see **Releasing a new version** below)
+- `.github/workflows/release.yml` - builds and publishes a GitHub Release automatically whenever you push to `main` (see **Releasing a new version** below)
 
 ## Important: building the .exe must happen on Windows
 
@@ -166,31 +166,33 @@ gets rendered to WAV/MP3.
 
 ## Releasing a new version
 
-The app's version lives in one place: `__version__` at the top of
-`rsc_midi_player.py` (shown in the window title bar and in Help > About).
-Pushing a matching git tag automatically builds the portable exe on a
-Windows GitHub Actions runner, zips it up with the README and license, and
-publishes it as a GitHub Release -- you don't build or upload anything by
-hand.
+Releases are fully automatic -- there's no tagging step to remember. Just
+commit and push to `main` (through GitHub Desktop or however you normally
+commit) and, if the push touched `rsc_midi_player.py`, `build_exe.py`, or
+`requirements.txt`, a GitHub Actions workflow builds the portable exe on a
+Windows runner, figures out the right version number, tags it, zips it up
+with the README and license, and publishes it as a GitHub Release marked
+"Latest" -- all without you touching the Actions tab.
 
-To cut a release:
+The version number is resolved automatically, first rule that matches wins:
 
-1. Bump `__version__` in `rsc_midi_player.py`, e.g. `"1.0.0"` -> `"1.1.0"`.
-2. Commit and push that change normally.
-3. Tag and push the tag:
-   ```
-   git tag v1.1.0
-   git push origin v1.1.0
-   ```
-4. Check the "Actions" tab on GitHub -- the Release workflow runs
-   automatically (only pushing a tag shaped like `v1.2.3` triggers it;
-   ordinary commits/pushes don't). A few minutes later, a new Release
-   appears under the repo's "Releases" page with
-   `RSC-Midi-Player-v1.1.0-windows.zip` attached, containing the built
-   `.exe`, `README.md`, and `LICENSE`.
+1. A `[release X.Y.Z]` anywhere in your commit message -- an explicit
+   one-off override, e.g. `git commit -m "fix drum channel [release 1.4.0]"`.
+2. `__version__` in `rsc_midi_player.py`, if you've bumped it ahead of the
+   last released version -- the normal way to cut a release with a specific
+   number in mind. Bump it, commit, push, done.
+3. Otherwise, the previous release's version with the patch number bumped
+   by one automatically (`1.3.2` -> `1.3.3`) -- so even if you forget to
+   touch the version entirely, pushing a change still ships a new release,
+   it just won't have a deliberate version bump.
 
-Keep the tag and `__version__` in sync (both `1.1.0`, just with the tag's
-`v` prefix) so the window title/About dialog match what people download.
+Whichever version wins gets written into the built exe, so the window
+title/About dialog always match the release people actually downloaded,
+even if you forgot to bump `__version__` yourself.
+
+You can also trigger a release manually with an exact version from GitHub's
+Actions tab (Release RSC MIDI Player > Run workflow > version field) if you
+ever need to.
 
 ## Troubleshooting
 
