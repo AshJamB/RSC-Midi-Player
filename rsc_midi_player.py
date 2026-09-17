@@ -144,6 +144,13 @@ GITHUB_RELEASES_LATEST_API = f"https://api.github.com/repos/{APP_GITHUB_USER}/RS
 # alone -- we never touch a folder name we don't recognize.
 UPDATE_FOLDER_NAME_RE = re.compile(r"^(RSC-Midi-Player-)(\d+\.\d+\.\d+)(-windows)$", re.IGNORECASE)
 
+# Sanity floor for the .exe pulled out of a downloaded update -- this build
+# bundles numpy and the FluidSynth DLLs, so a genuine build is comfortably
+# tens of MB. A file smaller than this is almost certainly a truncated or
+# corrupted download, never a real release, so it's rejected before it ever
+# gets near overwriting the working install.
+MIN_UPDATE_EXE_SIZE = 5 * 1024 * 1024
+
 
 def get_app_dir():
     """Directory the app's own folder (Soundfonts/, Midis/, library.json)
@@ -314,6 +321,13 @@ def start_self_update(zip_bytes, new_version_str=None):
     frozen .exe -- raises if called while running from source, since there's
     no exe here to replace.
 
+    Everything that can be checked ahead of time -- that the zip isn't
+    corrupt, that it actually contains an .exe, that the .exe isn't
+    suspiciously small (a truncated/corrupted download) -- is checked here,
+    entirely in a scratch temp folder, *before* anything about the current,
+    working install is touched. If any check fails, this raises and the
+    caller's install is left exactly as it was.
+
     If new_version_str is given and the app's own folder still follows the
     release-zip naming convention (RSC-Midi-Player-X.Y.Z-windows), the
     helper script also renames that folder to match the new version, so the
@@ -332,6 +346,13 @@ def start_self_update(zip_bytes, new_version_str=None):
         f.write(zip_bytes)
 
     with zipfile.ZipFile(zip_path) as zf:
+        bad_entry = zf.testzip()
+        if bad_entry is not None:
+            raise RuntimeError(
+                f"Downloaded update is corrupt (bad file inside the zip: {bad_entry}). "
+                "Nothing has been changed -- try Check for Updates again."
+            )
+
         exe_member = next((n for n in zf.namelist() if n.lower().endswith(".exe")), None)
         if exe_member is None:
             raise RuntimeError("Downloaded update .zip doesn't contain an .exe.")
@@ -343,6 +364,15 @@ def start_self_update(zip_bytes, new_version_str=None):
                     break
                 dst.write(chunk)
 
+    new_exe_size = os.path.getsize(new_exe_path)
+    if new_exe_size < MIN_UPDATE_EXE_SIZE:
+        raise RuntimeError(
+            f"Downloaded update looks incomplete or corrupt (the extracted .exe "
+            f"is only {new_exe_size / (1024*1024):.1f} MB, well under what a real "
+            "build should be). Nothing has been changed -- try Check for Updates "
+            "again."
+        )
+
     final_exe = current_exe
     rename_line = ""
     if new_version_str:
@@ -352,16 +382,23 @@ def start_self_update(zip_bytes, new_version_str=None):
             final_exe = os.path.join(new_dir, exe_name)
 
     # A short delay gives this process time to fully exit (and release its
-    # lock on current_exe) before the move is attempted. The exe is swapped
-    # in place first (while the folder still has its old name/path), then
-    # the whole folder is renamed (carrying the already-updated exe, plus
-    # library.json/Soundfonts/Midis, with it), then the app is relaunched
-    # from wherever it ended up.
+    # lock on current_exe) before anything below is attempted. The *current*
+    # exe is backed up (as "<name>.exe.bak", alongside it) before being
+    # overwritten -- so a bad update, even one that somehow slipped past the
+    # checks above, still leaves the previous known-good build recoverable
+    # (rename the .bak back) instead of just being gone. Order matters: back
+    # up + swap the exe while the folder still has its old name/path, THEN
+    # rename the whole folder (carrying the new exe, the .bak, and
+    # library.json/Soundfonts/Midis all together), THEN relaunch from
+    # wherever it ended up.
+    backup_exe = current_exe + ".bak"
     bat_path = os.path.join(tmp_dir, "apply_update.bat")
     with open(bat_path, "w", encoding="utf-8") as f:
         f.write(
             "@echo off\r\n"
             "timeout /t 2 /nobreak > NUL\r\n"
+            f'if exist "{backup_exe}" del /f /q "{backup_exe}"\r\n'
+            f'move /y "{current_exe}" "{backup_exe}"\r\n'
             f'move /y "{new_exe_path}" "{current_exe}"\r\n'
             f"{rename_line}"
             f'start "" "{final_exe}"\r\n'
@@ -1743,6 +1780,12 @@ class PlayerApp:
                         downloaded += len(chunk)
                         on_progress(downloaded, total)
                     data = b"".join(chunks)
+
+                if total is not None and downloaded != total:
+                    raise RuntimeError(
+                        f"Download was incomplete ({downloaded} of {total} bytes arrived) "
+                        "-- your current version hasn't been touched. Try again."
+                    )
 
                 self.root.after(0, progress.set_status, "Applying update...")
                 start_self_update(data, info["version_str"])

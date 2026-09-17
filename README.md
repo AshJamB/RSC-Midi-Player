@@ -273,12 +273,32 @@ rebuilding.
 Someone (or something) deleted a file out of `Soundfonts\`/`Midis\` without
 going through the app's Remove button. Just re-import it.
 
-**Antivirus flags the exe**
-This is a common false positive for PyInstaller-built executables (since
-they're a single unsigned binary that unpacks itself at runtime). It's not
-inherent to this app; you can verify by reading the source in
-`rsc_midi_player.py`. Code-signing the exe would resolve this but requires a
-paid certificate.
+**Antivirus flags the exe, or "Windows protected your PC" (SmartScreen)**
+This is a common false positive/warning for PyInstaller-built executables,
+not something specific to this app -- it's a single unsigned binary that
+unpacks itself at runtime, and Windows/Defender treat any unrecognized,
+unsigned exe this way regardless of what it actually does (you can verify
+by reading the source in `rsc_midi_player.py`). "Run anyway" on the
+SmartScreen dialog lets it through. Because self-update writes a brand-new
+exe each time, expect this prompt again after every update -- each build is
+a new, unrecognized file to SmartScreen even though it's the same app. The
+only real fix is code-signing the exe with a certificate, which costs money
+and needs its own setup in the release workflow (happy to add this later if
+it becomes worth it, but there's no free way around the warning otherwise).
+
+**"Failed to load Python DLL ...\_MEIxxxxx\pythonXXX.dll" after an update**
+This means the .exe that got installed is damaged -- either the download
+was interrupted, or antivirus/SmartScreen quarantined part of it right as
+it tried to run for the first time. Self-update now checks the downloaded
+zip and the size of the extracted exe *before* touching your existing
+install, specifically to catch a broken download before it overwrites a
+working one -- so this shouldn't happen going forward, and a failed check
+just shows an error dialog and leaves your current version untouched. If
+you still hit this on a version installed before that check existed: every
+update keeps the previous exe as `RSC-MIDI-Player.exe.bak` right next to
+the new one, so you can just delete the broken `RSC-MIDI-Player.exe` and
+rename `RSC-MIDI-Player.exe.bak` back to `RSC-MIDI-Player.exe` to get back
+to the last working version, then try Check for Updates again.
 
 ## Notes on how it works (for future changes)
 
@@ -324,4 +344,13 @@ paid certificate.
   that folder to the new version too (carrying `library.json`,
   `Soundfonts\`, `Midis\`, etc. with it) before launching the relaunched
   exe from its new home. A folder that doesn't match -- because it's been
-  renamed to something else -- is left untouched.
+  renamed to something else -- is left untouched. Before any of that
+  happens, `start_self_update()` verifies the downloaded zip isn't corrupt
+  (`ZipFile.testzip()`) and that the extracted `.exe` is at least
+  `MIN_UPDATE_EXE_SIZE` (a sanity floor well under a real build's size) --
+  entirely in a scratch temp folder, before the working install is touched
+  at all -- and the download step separately checks the byte count against
+  `Content-Length`. The `.bat` script also renames the current exe to
+  `<name>.exe.bak` immediately before overwriting it, so a bad update that
+  somehow gets past those checks still leaves the previous build recoverable
+  instead of gone.
