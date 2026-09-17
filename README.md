@@ -6,12 +6,16 @@ you've collected. No Java, no hunting through someone else's GitHub repo for
 a bundled font -- you load your own SoundFonts and MIDI files, and it
 remembers them for next time.
 
+Created by Ash Brittain ([AshJamB](https://github.com/AshJamB)).
+
 ## What's in this folder
 
 - `rsc_midi_player.py` - the whole app (Tkinter GUI + FluidSynth playback engine)
 - `requirements.txt` - Python packages needed
 - `build_exe.py` - packages the app into a single portable `.exe`
 - `README.md` - this file
+- `LICENSE` - MIT license
+- `.github/workflows/release.yml` - builds and publishes a GitHub Release automatically when you push a version tag (see **Releasing a new version** below)
 
 ## Important: building the .exe must happen on Windows
 
@@ -159,6 +163,34 @@ slate, since a fix for one SoundFont's instrument list is meaningless for
 another's. "Reset All to MIDI Defaults" clears every override for the
 current pairing. Overrides also apply to Export, so what you hear is what
 gets rendered to WAV/MP3.
+
+## Releasing a new version
+
+The app's version lives in one place: `__version__` at the top of
+`rsc_midi_player.py` (shown in the window title bar and in Help > About).
+Pushing a matching git tag automatically builds the portable exe on a
+Windows GitHub Actions runner, zips it up with the README and license, and
+publishes it as a GitHub Release -- you don't build or upload anything by
+hand.
+
+To cut a release:
+
+1. Bump `__version__` in `rsc_midi_player.py`, e.g. `"1.0.0"` -> `"1.1.0"`.
+2. Commit and push that change normally.
+3. Tag and push the tag:
+   ```
+   git tag v1.1.0
+   git push origin v1.1.0
+   ```
+4. Check the "Actions" tab on GitHub -- the Release workflow runs
+   automatically (only pushing a tag shaped like `v1.2.3` triggers it;
+   ordinary commits/pushes don't). A few minutes later, a new Release
+   appears under the repo's "Releases" page with
+   `RSC-Midi-Player-v1.1.0-windows.zip` attached, containing the built
+   `.exe`, `README.md`, and `LICENSE`.
+
+Keep the tag and `__version__` in sync (both `1.1.0`, just with the tag's
+`v` prefix) so the window title/About dialog match what people download.
 
 ## Troubleshooting
 

@@ -1,0 +1,59 @@
+# Builds the portable .exe and publishes a GitHub Release whenever a version
+# tag (v1.0.0, v1.2.3, etc.) is pushed. Regular commits/pushes to any branch
+# do NOT trigger this -- only pushing a matching tag does.
+#
+# To cut a release:
+#   1. Bump __version__ in rsc_midi_player.py to match (e.g. "1.1.0").
+#   2. Commit and push that as normal.
+#   3. git tag v1.1.0
+#      git push origin v1.1.0
+#   4. This workflow runs automatically, builds the exe on a Windows runner,
+#      zips it up, and publishes it as a GitHub Release attached to that tag.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write  # needed to create a Release and upload assets
+
+jobs:
+  build-and-release:
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Build portable exe
+        run: python build_exe.py
+
+      - name: Package release zip
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $zipName = "RSC-Midi-Player-$tag-windows.zip"
+          $stageDir = "release-stage"
+          New-Item -ItemType Directory -Path $stageDir | Out-Null
+          Copy-Item "dist/RSC-MIDI-Player.exe" -Destination $stageDir
+          Copy-Item "README.md" -Destination $stageDir
+          Copy-Item "LICENSE" -Destination $stageDir
+          Compress-Archive -Path "$stageDir/*" -DestinationPath $zipName
+          echo "ZIP_NAME=$zipName" >> $env:GITHUB_ENV
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.ZIP_NAME }}
+          generate_release_notes: true

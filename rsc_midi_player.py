@@ -30,6 +30,7 @@ import urllib.parse
 import urllib.request
 import uuid
 import wave
+import webbrowser
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
 # ---------------------------------------------------------------------------
@@ -91,10 +92,15 @@ else:
     _LAMEENC_IMPORT_ERROR = None
 
 
+__version__ = "1.0.0"
+
 APP_TITLE = "RSC MIDI Player"
+APP_AUTHOR = "Ash Brittain (AshJam)"
+APP_GITHUB_USER = "AshJamB"
+APP_REPO_URL = f"https://github.com/{APP_GITHUB_USER}/RSC-Midi-Player"
 NUM_CHANNELS = 16
 RENDER_SAMPLE_RATE = 44100
-DOWNLOAD_USER_AGENT = "Mozilla/5.0 (compatible; RSC-MIDI-Player/1.0)"
+DOWNLOAD_USER_AGENT = f"Mozilla/5.0 (compatible; RSC-MIDI-Player/{__version__})"
 MIDI_MAGIC = b"MThd"
 
 
@@ -817,7 +823,7 @@ class DownloadProgressDialog(ProgressDialog):
 class PlayerApp:
     def __init__(self, root):
         self.root = root
-        self.root.title(APP_TITLE)
+        self.root.title(f"{APP_TITLE} v{__version__}")
         self.root.geometry("600x360")
         self.root.resizable(False, False)
 
@@ -857,6 +863,13 @@ class PlayerApp:
 
     def _build_ui(self):
         pad = {"padx": 10, "pady": 6}
+
+        # -- Menu bar --
+        menubar = tk.Menu(self.root)
+        help_menu = tk.Menu(menubar, tearoff=0)
+        help_menu.add_command(label="About RSC MIDI Player", command=self._open_about_dialog)
+        menubar.add_cascade(label="Help", menu=help_menu)
+        self.root.config(menu=menubar)
 
         # -- SoundFont row --
         frm_sf = ttk.LabelFrame(self.root, text="SoundFont")
@@ -1439,6 +1452,39 @@ class PlayerApp:
     def _on_close(self):
         self.engine.shutdown()
         self.root.destroy()
+
+    # -- about -----------------------------------------
+    def _open_about_dialog(self):
+        dialog = tk.Toplevel(self.root)
+        dialog.title(f"About {APP_TITLE}")
+        dialog.resizable(False, False)
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        pad = {"padx": 24, "pady": 4}
+        ttk.Label(dialog, text=APP_TITLE, font=("", 14, "bold")).pack(padx=24, pady=(20, 2))
+        ttk.Label(dialog, text=f"Version {__version__}").pack(**pad)
+        ttk.Label(dialog, text="A portable player for MIDI files through any\nSoundFont — game soundfonts, retro fonts, or anything else.",
+                  justify="center").pack(padx=24, pady=(4, 10))
+        ttk.Separator(dialog, orient="horizontal").pack(fill="x", padx=20, pady=4)
+        ttk.Label(dialog, text=f"Created by {APP_AUTHOR}").pack(**pad)
+        ttk.Label(dialog, text=f"github.com/{APP_GITHUB_USER}", foreground="#0645AD", cursor="hand2").pack(**pad)
+
+        def open_repo(_event=None):
+            webbrowser.open(APP_REPO_URL)
+
+        for child in dialog.winfo_children():
+            if isinstance(child, ttk.Label) and child.cget("text") == f"github.com/{APP_GITHUB_USER}":
+                child.bind("<Button-1>", open_repo)
+
+        ttk.Label(dialog, text="Licensed under the MIT License.", foreground="#888").pack(pady=(6, 4))
+
+        ttk.Button(dialog, text="Close", command=dialog.destroy).pack(pady=(6, 18))
+
+        dialog.update_idletasks()
+        x = self.root.winfo_rootx() + (self.root.winfo_width() // 2) - (dialog.winfo_width() // 2)
+        y = self.root.winfo_rooty() + (self.root.winfo_height() // 2) - (dialog.winfo_height() // 2)
+        dialog.geometry(f"+{max(x, 0)}+{max(y, 0)}")
 
 
 def _fmt_time(seconds):
